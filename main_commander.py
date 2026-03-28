@@ -1130,6 +1130,41 @@ class MainCommandCenter:
                     msg += f"├ {layer_text}\n"
                     msg += f"├ Buy Next: `${self.next_buy_price:,.1f}`\n"
                     msg += f"└ Predicted Avg: `${self.predicted_avg_price:,.1f}`\n"
+
+                # 🧮 MARGIN ANALYSIS — แสดงเฉพาะเมื่อ Liq. ใกล้ (< 6%) เพื่อไม่รกหน้าจอ
+                if pos and a_bal >= 1.0 and abs(p_amt) > 0:
+                    liq_p = safe_float(pos.get('liquidationPrice', 0))
+                    iso_margin = safe_float(pos.get('isolatedWallet', 0))
+                    if liq_p > 0 and iso_margin > 0 and mark_p > 0 and (mark_p - liq_p) / mark_p * 100 < 6.0:
+                        cur_dist = (mark_p - liq_p) / mark_p * 100
+
+                        # Option A: เติม margin เพียวๆ
+                        new_margin_a = iso_margin + a_bal
+                        new_liq_a = entry_p - (new_margin_a / abs(p_amt))
+                        dist_a = (mark_p - new_liq_a) / mark_p * 100
+
+                        # Option DCA: เปิดไม้ถัดไป
+                        if self.next_buy_price > 0 and self.active_layers < 12:
+                            lot_u_est = max(200.0, min((w_bal * 0.8 / 5) * self.leverage, 500.0))
+                            dca_qty = (a_bal * self.leverage) / self.next_buy_price
+                            new_qty = abs(p_amt) + dca_qty
+                            new_entry = (abs(p_amt) * entry_p + dca_qty * self.next_buy_price) / new_qty
+                            new_margin_dca = iso_margin + a_bal
+                            new_liq_dca = new_entry - (new_margin_dca / new_qty)
+                            dist_dca = (mark_p - new_liq_dca) / mark_p * 100
+                            safe_a   = "✅" if dist_a   >= 5.0 else "⚠️"
+                            safe_dca = "✅" if dist_dca >= 5.0 else "⚠️"
+                            msg += f"━━━━━━━━━━━━━━━━━━\n"
+                            msg += f"🧮 *MARGIN ANALYSIS* (ใช้ `${a_bal:.2f}` avail)\n"
+                            msg += f"├ ตอนนี้:  Liq. `${liq_p:,.0f}` ห่าง `{cur_dist:.2f}%`\n"
+                            msg += f"├ {safe_a} เติม Margin:  Liq. `${new_liq_a:,.0f}` ห่าง `{dist_a:.2f}%`\n"
+                            msg += f"└ {safe_dca} DCA ไม้ {self.active_layers+1}: Liq. `${new_liq_dca:,.0f}` ห่าง `{dist_dca:.2f}%`\n"
+                        else:
+                            safe_a = "✅" if dist_a >= 5.0 else "⚠️"
+                            msg += f"━━━━━━━━━━━━━━━━━━\n"
+                            msg += f"🧮 *MARGIN ANALYSIS* (ใช้ `${a_bal:.2f}` avail)\n"
+                            msg += f"├ ตอนนี้:       Liq. `${liq_p:,.0f}` ห่าง `{cur_dist:.2f}%`\n"
+                            msg += f"└ {safe_a} เติม Margin: Liq. `${new_liq_a:,.0f}` ห่าง `{dist_a:.2f}%`\n"
             else:
                 msg += f"💤 *STATUS:* พอร์ตว่าง (กำลังรอสัญญาณเข้าที่ดีที่สุด)\n"
                 msg += f"📍 Last Price: `${self.current_price:,.2f}`\n"
@@ -1604,9 +1639,9 @@ class MainCommandCenter:
                 await self.tg.send_message(f"⚠️ *AUTO-MONITOR*: ไม้ถึง `{self.active_layers}/12` → เปลี่ยนเป็นโหมด `SAFE` เพื่อลดความเสี่ยง!")
                 self._monitor_last_alert = {"type": "high_layers", "pnl": pnl, "layers": self.active_layers}
 
-        # ---- Rule 5: ขาดทุนเกิน → เตือน ----
+        # ---- Rule 5: ขาดทุนเกิน → เตือน (cooldown 10 นาที ป้องกัน spam) ----
         if pnl <= self.MONITOR_MAX_LOSS:
-            if alert["type"] != "max_loss" or abs(pnl - alert["pnl"]) > 5.0:
+            if alert["type"] != "max_loss" or abs(pnl - alert["pnl"]) > 10.0:
                 logger.warning(f"🤖 Monitor: ขาดทุน ${pnl:.2f} เกินขีดจำกัด!")
                 await self.tg.send_message(f"🚨 *AUTO-MONITOR*: ขาดทุน `${pnl:.2f}` เกิน `-${abs(self.MONITOR_MAX_LOSS)}` แล้ว!\nกรุณาพิจารณาปิด Position หรือเติมเงินครับ")
                 self._monitor_last_alert = {"type": "max_loss", "pnl": pnl, "layers": self.active_layers}
@@ -1621,13 +1656,24 @@ class MainCommandCenter:
                 if liq_dist_pct < 4.0:
                     if alert["type"] != "liq_near" or abs(liq_dist_pct - alert.get("pnl", 99)) > 0.5:
                         logger.critical(f"🚨 Monitor: Liq. ใกล้มาก! ห่างแค่ {liq_dist_pct:.1f}%")
-                        await self.tg.send_message(
+                        iso_margin = safe_float(pos.get('isolatedWallet', 0)) if pos else 0.0
+                        p_amt_mon = safe_float(pos.get('positionAmt', 0)) if pos else 0.0
+                        _usdt_mon = next((a for a in (acc or {}).get('assets', []) if a['asset'] == 'USDT'), None)
+                        avail_mon = safe_float(_usdt_mon['availableBalance']) if _usdt_mon else 0.0
+                        liq_msg = (
                             f"🚨🚨 *LIQ. DANGER!* 🚨🚨\n"
-                            f"ราคา Liq.: `${liq_p:,.0f}`\n"
+                            f"ราคา Liq.: `${liq_p:,.0f}` | ห่างแค่ `{liq_dist_pct:.1f}%`\n"
                             f"ราคาปัจจุบัน: `${self.current_price:,.0f}`\n"
-                            f"ห่างแค่ `{liq_dist_pct:.1f}%` เท่านั้น!\n"
-                            f"⚡ *กรุณาเติมเงินหรือปิด Position ด่วน!*"
                         )
+                        if avail_mon >= 1.0 and iso_margin > 0 and abs(p_amt_mon) > 0:
+                            new_liq_a = entry_p - ((iso_margin + avail_mon) / abs(p_amt_mon))
+                            dist_a = (self.current_price - new_liq_a) / self.current_price * 100
+                            safe_a = "✅" if dist_a >= 5.0 else "⚠️"
+                            liq_msg += f"─────────────────\n"
+                            liq_msg += f"💡 ถ้าเติม `${avail_mon:.2f}` เป็น margin:\n"
+                            liq_msg += f"{safe_a} Liq. ใหม่: `${new_liq_a:,.0f}` ห่าง `{dist_a:.2f}%`\n"
+                        liq_msg += f"⚡ *กรุณาเติมเงินหรือปิด Position ด่วน!*"
+                        await self.tg.send_message(liq_msg)
                         self._monitor_last_alert = {"type": "liq_near", "pnl": liq_dist_pct, "layers": self.active_layers}
 
 async def health_server(tg: TelegramCommander):
