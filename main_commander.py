@@ -529,17 +529,24 @@ class MainCommandCenter:
                 self._obi_flip_alerted = now_flip
                 _flip_cd = self._get_dynamic_cooldown()
                 _flip_regime, _ = self._get_regime()
-                asyncio.ensure_future(self.tg.send_message(
-                    f"🚨 *OBI FLIP ALERT (Triple Verified)!*\n"
-                    f"OBI ร่วงจาก `{obi_recent_max:+.2f}` → `{self._obi_score:+.2f}`\n"
-                    f"📉 OFI: `{self._ofi_score:+.2f}` | Trade OBI: `{self._trade_obi:+.2f}`\n"
-                    f"🧭 Regime: `{_flip_regime}` → ชะลอระบบ `{_flip_cd}s` (แรงขายจริง ไม่ใช่ Spoof)"
-                ))
-                self._kill_switch = True
-                self._kill_time = now_flip  # Dynamic cooldown จะคำนวณใน _check_kill_switch
-                self._kill_reason = f"Triple Verified Flip (OFI {self._ofi_score:+.2f} / TradeOBI {self._trade_obi:+.2f})"
-                _r, _rng = self._get_regime()
-                logger.warning(f"🚨 OBI FLIP TRIPLE-VERIFIED: {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} | Regime {_r}({_rng:.2f}%) | Cooldown {_flip_cd}s")
+
+                # 📊 CHOPPY BYPASS: OBI Flip ใน CHOPPY = Mechanical rebalance ไม่ใช่ Informational signal
+                # Data: 88.9% FLAT outcome → Kill Switch ทำให้เสียโอกาส Grid/DCA โดยไม่จำเป็น
+                # Volatility Spike Kill Switch ยังทำงานปกติทุก Regime
+                if _flip_regime == "CHOPPY":
+                    logger.info(f"🟡 OBI FLIP BYPASSED (CHOPPY): {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} — Grid continues")
+                else:
+                    asyncio.ensure_future(self.tg.send_message(
+                        f"🚨 *OBI FLIP ALERT (Triple Verified)!*\n"
+                        f"OBI ร่วงจาก `{obi_recent_max:+.2f}` → `{self._obi_score:+.2f}`\n"
+                        f"📉 OFI: `{self._ofi_score:+.2f}` | Trade OBI: `{self._trade_obi:+.2f}`\n"
+                        f"🧭 Regime: `{_flip_regime}` → ชะลอระบบ `{_flip_cd}s` (แรงขายจริง ไม่ใช่ Spoof)"
+                    ))
+                    self._kill_switch = True
+                    self._kill_time = now_flip  # Dynamic cooldown จะคำนวณใน _check_kill_switch
+                    self._kill_reason = f"Triple Verified Flip (OFI {self._ofi_score:+.2f} / TradeOBI {self._trade_obi:+.2f})"
+                    _r, _rng = self._get_regime()
+                    logger.warning(f"🚨 OBI FLIP TRIPLE-VERIFIED: {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} | Regime {_r}({_rng:.2f}%) | Cooldown {_flip_cd}s")
 
                 # 📓 FLIP LOGGER — บันทึก event นี้ และ schedule outcome check ใน 5 นาที
                 _flip_entry = {
