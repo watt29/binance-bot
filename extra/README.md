@@ -452,6 +452,13 @@ pm2 logs bot
 pm2 restart bot
 ```
 
+### 11.4 ซิงค์โค้ดใหม่ขึ้น VPS (ทุกครั้งที่ push)
+```bash
+cd binance-bot
+git pull
+pm2 restart bot
+```
+
 ---
 
 ## 🔬 12. หลักการ Microstructure ที่บอทใช้
@@ -472,6 +479,39 @@ pm2 restart bot
 | **Self-Learning** | Flip Logger (L7) สะสม Win Rate แยก Regime → ปรับ threshold อนาคต |
 | **Execution Probability** | OBI_deep: tick-distance weight สะท้อนโอกาสถูกจับคู่จริง — ใกล้ mid = หนักกว่า |
 | **Deep Order Flow** | OBI_flat vs OBI_deep diverge > 0.25 → Layering/Spoofing signature ไกล mid |
+| **Regime-Aware OBI Flip** | CHOPPY: Bypass Kill Switch (Mechanical/Noise) → TRENDING/VOLATILE: Kill Switch ON (Informational) |
+
+---
+
+## 🧠 14. Why OBI Flip ≠ Kill Switch ใน CHOPPY Market
+
+### Mechanical vs Informational Signal
+
+| ลักษณะ | CHOPPY | TRENDING/VOLATILE |
+|---|---|---|
+| ผู้ขับเคลื่อน | HFT / Market Maker (Mechanical) | Informed Trader / Institution (Informational) |
+| สาเหตุ OBI Flip | Flickering Quotes, Bait Walls, Risk Management | Liquidity Vacuum, Liquidation Cascade, Breakout |
+| ผลต่อราคา | ไม่มีนัยสำคัญ — กลับสมดุลเอง | Permanent Price Impact — เทรนด์วิ่งต่อ |
+| Empirical Data (n=18) | **88.9% FLAT** (±0.1% ใน 5 นาที) | 100% DUMP ที่ตรวจพบ |
+| Kill Switch | **Bypass** — Grid เดินต่อ | **Active** — หยุดซื้อ |
+
+### ทำไม Volatility Spike Kill Switch ยังทำงานทุก Regime
+
+OBI Flip ใน CHOPPY อาจเป็น Noise แต่ **Volatility Spike** คือสัญญาณเตือน Regime Transition:
+```
+CHOPPY → TRENDING = inst_vol พุ่งสูง ≥ 2 ครั้งติดต่อกัน
+```
+ระบบจึงแยก trigger ออกจากกัน:
+- **OBI Flip Kill Switch** → Regime-Aware (bypass ใน CHOPPY)
+- **Volatility Spike Kill Switch** → ทุก Regime ไม่มีข้อยกเว้น
+
+### เกราะป้องกันที่ยังคงอยู่ใน CHOPPY
+
+แม้ OBI Flip จะ bypass แต่บอทยังมีระบบป้องกันชั้นอื่น:
+1. **OFI Anchor** — entry gate ต้องผ่าน OFI confirmed ก่อนเปิดไม้
+2. **Volatility Spike KS** — ตรวจ inst_vol ทุก loop
+3. **Auto-Monitor** — Layer ≥ 6 → SAFE mode อัตโนมัติ
+4. **Anti-Falling Knife** — ไม่เปิดไม้แรกถ้า inst_vol > 0.4%
 
 ---
 
