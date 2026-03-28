@@ -1692,13 +1692,21 @@ class MainCommandCenter:
                             f"ราคา Liq.: `${liq_p:,.0f}` | ห่างแค่ `{liq_dist_pct:.1f}%`\n"
                             f"ราคาปัจจุบัน: `${self.current_price:,.0f}`\n"
                         )
-                        if avail_mon >= 1.0 and iso_margin > 0 and abs(p_amt_mon) > 0:
-                            new_liq_a = entry_p - ((iso_margin + avail_mon) / abs(p_amt_mon))
-                            dist_a = (self.current_price - new_liq_a) / self.current_price * 100
-                            safe_a = "✅" if dist_a >= 5.0 else "⚠️"
+                        if iso_margin > 0 and abs(p_amt_mon) > 0:
+                            # คำนวณขั้นต่ำที่ต้องเติมเพื่อให้ห่าง Liq. 5%
+                            # target_liq = mark * (1 - 0.05)
+                            # target_liq = entry - (margin_new / qty)
+                            # margin_new = (entry - target_liq) * qty
+                            target_liq = self.current_price * 0.95
+                            margin_needed = (entry_p - target_liq) * abs(p_amt_mon)
+                            top_up_min = max(0.0, margin_needed - iso_margin)
                             liq_msg += f"─────────────────\n"
-                            liq_msg += f"💡 ถ้าเติม `${avail_mon:.2f}` เป็น margin:\n"
-                            liq_msg += f"{safe_a} Liq. ใหม่: `${new_liq_a:,.0f}` ห่าง `{dist_a:.2f}%`\n"
+                            liq_msg += f"💡 *เติมขั้นต่ำ `${top_up_min:.2f}` เพื่อให้ปลอดภัย 5%*\n"
+                            if avail_mon >= 1.0:
+                                new_liq_a = entry_p - ((iso_margin + avail_mon) / abs(p_amt_mon))
+                                dist_a = (self.current_price - new_liq_a) / self.current_price * 100
+                                safe_a = "✅" if dist_a >= 5.0 else "⚠️"
+                                liq_msg += f"{safe_a} ถ้าเติมทั้งหมด `${avail_mon:.2f}`: Liq. `${new_liq_a:,.0f}` ห่าง `{dist_a:.2f}%`\n"
                         liq_msg += f"⚡ *กรุณาเติมเงินหรือปิด Position ด่วน!*"
                         await self.tg.send_message(liq_msg)
                         self._monitor_last_alert = {"type": "liq_near", "pnl": liq_dist_pct, "layers": self.active_layers}
