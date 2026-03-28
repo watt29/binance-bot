@@ -288,7 +288,8 @@ class MainCommandCenter:
         self._last_report_time = 0.0
 
         # 📊 ORDER BOOK IMBALANCE (Whale Signal)
-        self._obi_score = 0.0          # -1.0 ถึง +1.0
+        self._obi_score = 0.0          # -1.0 ถึง +1.0  (flat weight, Top 20)
+        self._obi_deep = 0.0           # -1.0 ถึง +1.0  (distance-weighted, Top 20)
         self._obi_bid_vol = 0.0
         self._obi_ask_vol = 0.0
         self._obi_last_update = 0.0
@@ -474,6 +475,20 @@ class MainCommandCenter:
             self._obi_bid_vol = bid_val
             self._obi_ask_vol = ask_val
             self._obi_last_update = time.time()
+
+            # ── 1b. OBI Deep (Top 5 + Distance-Weighted) ─────────
+            # ใช้เฉพาะ Top 5 levels — จุดสมดุล depth/noise ที่ดีที่สุด
+            # w_i = 1 / (1 + d_i)  โดย d_i = |price_i - mid| / tick_size (tick distance)
+            # tick_size BTC/USDT Futures = $0.10
+            mid_p = (bids_f[0][0] + asks_f[0][0]) / 2 if bids_f and asks_f else cur_p_ref
+            if mid_p > 0:
+                tick_size = 0.10
+                bids_top5 = bids_f[:5]
+                asks_top5 = asks_f[:5]
+                w_bid = sum(q / (1.0 + abs(p - mid_p) / tick_size) for p, q in bids_top5)
+                w_ask = sum(q / (1.0 + abs(p - mid_p) / tick_size) for p, q in asks_top5)
+                w_total = w_bid + w_ask
+                self._obi_deep = (w_bid - w_ask) / w_total if w_total > 0 else 0.0
 
             # ── OBI Flip Detection (Filtered) ────────────────────────────────
             self._obi_buffer.append(self._obi_score)
@@ -926,7 +941,8 @@ class MainCommandCenter:
                     if (time.time() - self.last_close_time) > 60:
                         p_range = (cur_p - stats['low']) / (stats['high'] - stats['low']) * 100 if stats['high'] > stats['low'] else 50  # pyre-ignore
                         # 📊 OBI+OFI Filter: ไม่เปิดไม้แรกถ้าแรงขายหนักมาก และ OFI ยืนยัน
-                        obi_ok = (self._obi_score >= -0.3 or self._obi_last_update == 0) and self._obi_confirmed()
+                        # Deep OBI (Top 5 + distance-weighted) ยืนยันว่าแรงขายจริงไม่ใช่ Spoof จากระดับไกล
+                        obi_ok = (self._obi_score >= -0.3 or self._obi_last_update == 0) and self._obi_confirmed() and (self._obi_deep >= -0.35 or self._obi_last_update == 0)
                         if p_range < 85 and inst_vol < 0.4 and obi_ok:
                             if a_bal >= (lot_u / self.leverage): await self._execute_trade(client, "BUY", lot_u)
                 else:
@@ -978,7 +994,8 @@ class MainCommandCenter:
                                 )
                                 self._last_report_time = time.time()
 
-                    obi_dca_ok = (self._obi_score >= -0.3 and self._obi_confirmed()) or self.active_layers >= 10 or self._obi_last_update == 0
+                    # Deep OBI gate เพิ่มความแม่นยำ แต่ bypass เมื่อ layer สูง (≥10) เพราะต้อง DCA ต่อ
+                    obi_dca_ok = (self._obi_score >= -0.3 and self._obi_confirmed() and self._obi_deep >= -0.35) or self.active_layers >= 10 or self._obi_last_update == 0
                     if cur_p <= self.next_buy_price and self.active_layers < 12 and obi_dca_ok:
                         logger.info(f"🔮 Prediction: Buy @ {self.next_buy_price:.1f} -> New Avg {self.predicted_avg_price:.1f} | OBI {self._obi_score:+.2f}")
                         if a_bal >= (lot_u / self.leverage):
@@ -1475,22 +1492,27 @@ class MainCommandCenter:
             return "`กำลังเชื่อมต่อ Order Book...`"
 
         obi = self._obi_score
+        obi_deep = self._obi_deep
         ofi = self._ofi_score
         bid = self._obi_bid_vol / 1_000_000
         ask = self._obi_ask_vol / 1_000_000
         confirmed = self._obi_confirmed()
         conf_tag = "" if confirmed else " ⚠️`(OFI ไม่ยืนยัน)`"
 
+        # Deep Spoof hint: OBI_flat สูง แต่ OBI_deep ต่ำ = กำแพงอยู่ไกล mid → สัญญาณ Spoof เพิ่มเติม
+        deep_gap = obi - obi_deep  # บวก = flat สูงกว่า deep = wall ไกล mid
+        spoof_hint = " 🔍`(Deep diverge — wall ไกล mid)`" if deep_gap > 0.25 else ""
+
         if obi >= 0.6:
-            signal = f"🐳 *STRONG BUY* | OBI `{obi:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}"
+            signal = f"🐳 *STRONG BUY* | OBI_flat `{obi:+.2f}` OBI_deep `{obi_deep:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}{spoof_hint}"
         elif obi >= 0.3:
-            signal = f"🟢 *Buy Pressure* | OBI `{obi:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}"
+            signal = f"🟢 *Buy Pressure* | OBI_flat `{obi:+.2f}` OBI_deep `{obi_deep:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}{spoof_hint}"
         elif obi <= -0.6:
-            signal = f"🐳 *STRONG SELL* | OBI `{obi:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}"
+            signal = f"🐳 *STRONG SELL* | OBI_flat `{obi:+.2f}` OBI_deep `{obi_deep:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}{spoof_hint}"
         elif obi <= -0.3:
-            signal = f"🔴 *Sell Pressure* | OBI `{obi:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}"
+            signal = f"🔴 *Sell Pressure* | OBI_flat `{obi:+.2f}` OBI_deep `{obi_deep:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{conf_tag}{spoof_hint}"
         else:
-            signal = f"⚖️ *Balanced* | OBI `{obi:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`"
+            signal = f"⚖️ *Balanced* | OBI_flat `{obi:+.2f}` OBI_deep `{obi_deep:+.2f}` OFI `{ofi:+.2f}` | `${bid:.1f}M` vs `${ask:.1f}M`{spoof_hint}"
 
         # Whale Walls (กรอง Spoof ออกแล้ว) + Tiered display
         tier_icon = {"mega": "🔴", "strong": "🟠", "watch": "🟡"}

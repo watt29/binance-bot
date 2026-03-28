@@ -9,7 +9,8 @@
       "Bash(python -m py_compile /c/Users/Asus/Desktop/binance-sever-render/binance_global/async_client.py)",
       "Bash(pm2 restart:*)",
       "Bash(pm2 logs:*)",
-      "Bash(pm2 list:*)"
+      "Bash(pm2 list:*)",
+      "Bash(git -C C:UsersAsusDesktopbinance-sever-render log --oneline --follow -- extra/README.md)"
     ]
   }
 }
