@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pm2 resurrect:*)",
+      "Bash(grep -E \"\\\\.\\(bat|sh|py|json\\)$\")",
+      "Bash(python -m py_compile main_commander.py)",
+      "Bash(xargs grep:*)",
+      "Bash(python -m py_compile /c/Users/Asus/Desktop/binance-sever-render/main_commander.py)",
+      "Bash(python -m py_compile /c/Users/Asus/Desktop/binance-sever-render/binance_global/async_client.py)",
+      "Bash(pm2 restart:*)",
+      "Bash(pm2 logs:*)",
+      "Bash(pm2 list:*)"
+    ]
+  }
+}

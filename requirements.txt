@@ -1,0 +1,6 @@
+python-binance
+python-dotenv
+requests
+rich
+loguru
+aiohttp

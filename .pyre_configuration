@@ -1,0 +1,13 @@
+{
+  "source_directories": [
+    "."
+  ],
+  "search_path": [
+    "c:/Users/Asus/Desktop/Binance_sever/venv/Lib/site-packages",
+    "c:/Users/Asus/Desktop/Binance_sever/shared"
+  ],
+  "exclude": [
+    ".*/venv/.*",
+    ".*/__pycache__/.*"
+  ]
+}

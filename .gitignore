@@ -1,0 +1,23 @@
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Pycache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and Data
+logs/
+data/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets and Configs
+.env
+configs/secret.json
+extra/telegram-smart-memo-4f5e48a011dc.json 

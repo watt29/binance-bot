@@ -1,0 +1,18 @@
+{
+  "api_key": "",
+  "api_secret": "",
+  "telegram_token": "",
+  "telegram_chat_id": "",
+  "stop_loss_pct": 3.0,
+  "take_profit_pct": 5.0,
+  "grid_levels": 5,
+  "grid_step_pct": 0.5,
+  "dgt_mode": true,
+  "grid_range_pct": 5.0,
+  "slippage_tolerance": 0.05,
+  "max_amount_per_layer": 2000.0,
+  "budget_utilization_pct": 0.95,
+  "chrome_profile": "",
+  "email": "",
+  "password": ""
+}
