@@ -526,10 +526,10 @@ class MainCommandCenter:
                 # 📓 FLIP LOGGER — บันทึก event นี้ และ schedule outcome check ใน 5 นาที
                 _flip_entry = {
                     "time": now_flip,
-                    "obi_before": round(obi_recent_max, 3),
-                    "obi_after": round(self._obi_score, 3),
-                    "trade_obi": round(self._trade_obi, 3),
-                    "ofi": round(self._ofi_score, 3),
+                    "obi_before": round(obi_recent_max, 3),  # pyre-ignore
+                    "obi_after": round(self._obi_score, 3),  # pyre-ignore
+                    "trade_obi": round(self._trade_obi, 3),  # pyre-ignore
+                    "ofi": round(self._ofi_score, 3),  # pyre-ignore
                     "price": self.current_price,
                     "regime": _flip_regime,
                     "cooldown": _flip_cd,
@@ -1360,8 +1360,8 @@ class MainCommandCenter:
                     label = "DUMP"
                 else:
                     label = "FLAT"
-                entry_ref["outcome_price"] = round(outcome_price, 2)
-                entry_ref["outcome_delta"] = round(delta_pct, 4)
+                entry_ref["outcome_price"] = round(outcome_price, 2)  # pyre-ignore
+                entry_ref["outcome_delta"] = round(delta_pct, 4)  # pyre-ignore
                 entry_ref["outcome_label"] = label
                 logger.info(
                     f"📓 Flip Outcome [{label}]: "
@@ -1405,7 +1405,7 @@ class MainCommandCenter:
 
         # แสดง 3 events ล่าสุด
         lines.append("─ ล่าสุด 3 events ─")
-        for e in list(completed)[-3:]:
+        for e in list(completed)[-3:]:  # pyre-ignore
             t = datetime.fromtimestamp(e["time"]).strftime("%H:%M")
             lines.append(
                 f"  `{t}` [{e['regime']}] {e['outcome_label']} "
