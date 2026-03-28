@@ -160,34 +160,45 @@ class TelegramCommander:
             logger.info(f"📩 Telegram Command: '{t}' from @{username} (Tokens Left: {self._user_buckets[user_id]['tokens']:.1f})")
 
             async with self._busy_lock:
-                if t == "📊 เช็คพอร์ต": await self.bot.send_combined_report()
-                elif t == "💰 กำไรวันนี้": await self.bot.send_trade_report()
-                elif t == "⏸️ หยุดชั่วคราว": await self.bot.set_pause(True)
-                elif t == "▶️ เริ่มรันต่อ": await self.bot.set_pause(False)
-                elif t == "🛡️ ขอปลอดภัยไว้ก่อน":
+                # ── ดูข้อมูล ──
+                if t == "📊 พอร์ต" or t == "📊 เช็คพอร์ต":
+                    await self.bot.send_combined_report()
+                elif t == "💰 กำไรวันนี้":
+                    await self.bot.send_trade_report()
+                elif t == "📓 Flip Stats":
+                    await self.send_message(self.bot._get_flip_stats())
+                # ── เปลี่ยน Mode ──
+                elif t in ("🛡️ SAFE", "🛡️ ขอปลอดภัยไว้ก่อน"):
                     self.bot.strategy_mode = "SAFE"
                     await self.bot.update_strategy_parameters()
-                    await self.send_message("🛡️ *โหมดปลอดภัย (SAFE):* ถอยระยะห่างไม้เพิ่มขึ้น 50% และลดเป้ากำไรลงเพื่อเคลียร์ของไวขึ้น!")
+                    await self.send_message("🛡️ *SAFE Mode:* ถอยระยะห่างไม้ +50% ลด TP")
                     await self.bot.send_combined_report()
-                elif t == "💸 ขอกำไรเข้าพอร์ตบ่อยๆ":
+                elif t in ("💸 PROFIT", "💸 ขอกำไรเข้าพอร์ตบ่อยๆ"):
                     self.bot.strategy_mode = "PROFIT"
                     await self.bot.update_strategy_parameters()
-                    await self.send_message("💸 *โหมดกำไรไว (PROFIT):* ลดเป้ากำไรลง 50% เพื่อปิดงานให้จบไวที่สุด!")
+                    await self.send_message("💸 *PROFIT Mode:* ลด TP 50% ปิดงานเร็ว")
                     await self.bot.send_combined_report()
-                elif t == "🔄 ปล่อยแบบเดิม":
+                elif t in ("🔄 NORMAL", "🔄 ปล่อยแบบเดิม"):
                     self.bot.strategy_mode = "NORMAL"
                     await self.bot.update_strategy_parameters()
-                    await self.send_message("🔄 *โหมดปกติ (NORMAL):* บอทตัดสินใจตามความผันผวนของตลาดเอง")
+                    await self.send_message("🔄 *NORMAL Mode:* บอทตัดสินใจตามตลาดเอง")
                     await self.bot.send_combined_report()
-                elif t == "💥 ปิดทุกออเดอร์":
+                # ── ควบคุม Bot ──
+                elif t in ("⏸️ หยุด", "⏸️ หยุดชั่วคราว"):
+                    await self.bot.set_pause(True)
+                elif t in ("▶️ รันต่อ", "▶️ เริ่มรันต่อ"):
+                    await self.bot.set_pause(False)
+                elif t in ("💥 ปิด Position", "💥 ปิดทุกออเดอร์"):
                     await self.bot.emergency_close()
-                elif t == "🔄 รีสตาร์ทบอท (PM2)":
-                    await self.send_message("🔄 กำลังสั่งให้ PM2 รีสตาร์ทบอท...")
+                # ── ระบบ ──
+                elif t in ("🔄 Restart", "🔄 รีสตาร์ทบอท (PM2)"):
+                    await self.send_message("🔄 กำลัง Restart...")
                     os.system("pm2 restart bot")
-                elif t == "🛑 ปิดบอทถาวร (PM2 Stop)":
-                    await self.send_message("🛑 สั่งให้ PM2 ปิดบอทแล้ว!\n⚠️ *คำเตือน:* คุณจะไม่สามารถเปิดบอทกลับมาได้จาก Telegram คุณต้องล็อคอินเข้าเซิร์ฟเวอร์/คอมพิวเตอร์เพื่อพิมพ์ `pm2 start bot` ด้วยตัวเอง!")
+                elif t in ("🛑 Stop Bot", "🛑 ปิดบอทถาวร (PM2 Stop)"):
+                    await self.send_message("🛑 *PM2 Stop* — ต้องเปิดเองที่เครื่องด้วย `pm2 start bot`")
                     os.system("pm2 stop bot")
-                elif t == "/start": await self._send_menu()
+                elif t == "/start":
+                    await self._send_menu()
 
         except Exception as e:
             logger.error(f"Process Update Error: {e}")
@@ -240,14 +251,19 @@ class TelegramCommander:
 
     async def _send_menu(self):
         kb = {
-            "keyboard": [[{"text": "📊 เช็คพอร์ต"}, {"text": "💰 กำไรวันนี้"}],
-                        [{"text": "🛡️ ขอปลอดภัยไว้ก่อน"}, {"text": "💸 ขอกำไรเข้าพอร์ตบ่อยๆ"}],
-                        [{"text": "🔄 ปล่อยแบบเดิม"}],
-                        [{"text": "⏸️ หยุดชั่วคราว"}, {"text": "▶️ เริ่มรันต่อ"}, {"text": "💥 ปิดทุกออเดอร์"}],
-                        [{"text": "🔄 รีสตาร์ทบอท (PM2)"}, {"text": "🛑 ปิดบอทถาวร (PM2 Stop)"}]],
+            "keyboard": [
+                # ── แถว 1: ดูข้อมูล ──
+                [{"text": "📊 พอร์ต"}, {"text": "💰 กำไรวันนี้"}, {"text": "📓 Flip Stats"}],
+                # ── แถว 2: เปลี่ยน Mode ──
+                [{"text": "🛡️ SAFE"}, {"text": "💸 PROFIT"}, {"text": "🔄 NORMAL"}],
+                # ── แถว 3: ควบคุม Bot ──
+                [{"text": "⏸️ หยุด"}, {"text": "▶️ รันต่อ"}, {"text": "💥 ปิด Position"}],
+                # ── แถว 4: ระบบ ──
+                [{"text": "🔄 Restart"}, {"text": "🛑 Stop Bot"}],
+            ],
             "resize_keyboard": True
         }
-        await self.send_message("🏰 *COMMANDER v119.8 (ASYNC): Strategy Ready*\nเลือกคำสั่งที่ต้องการได้เลยครับ!", reply_markup=kb)
+        await self.send_message("🏰 *COMMANDER v2.0: Ready*\nเลือกคำสั่งได้เลยครับ!", reply_markup=kb)
 
 class MainCommandCenter:
     def __init__(self):
@@ -301,6 +317,13 @@ class MainCommandCenter:
         self._trade_obi: float = 0.0          # Trade OBI: -1.0 (sell) ถึง +1.0 (buy)
         self.TRADE_OBI_WINDOW: float = 30.0   # Time window (วินาที)
 
+        # 📓 FLIP LOGGER (Priority 4: Self-Learning) — บันทึกทุก OBI Flip เพื่อสร้าง Pattern
+        # เก็บสูงสุด 100 events ล่าสุด (deque auto-evict เก่าออก)
+        self._flip_log: deque = deque(maxlen=100)
+        # {time, obi_before, obi_after, trade_obi, ofi, price, regime, cooldown,
+        #  outcome_price (ราคา 5 นาทีหลัง), outcome_delta (%), outcome_label}
+        self._flip_pending_outcome: list = []  # รอ record outcome หลัง 5 นาที
+
         # 📚 LOCAL ORDER BOOK (Binance standard sync)
         self._lob_bids: dict = {}        # {price: qty}
         self._lob_asks: dict = {}        # {price: qty}
@@ -317,7 +340,12 @@ class MainCommandCenter:
         # เงื่อนไข kill switch — ปรับให้เหมาะกับพอร์ตเล็ก margin ~$300
         self.KS_VOL_THRESHOLD  = 1.0    # inst_vol > 1.0% = volatile (ลดจาก 1.5)
         self.KS_VOL_SPIKE_MAX  = 2      # spike 2 รอบติดกัน = trigger (ไวขึ้น)
-        self.KS_COOLDOWN_SEC   = 180    # รอ 3 นาที (ลดจาก 5 เพื่อไม่พลาดโอกาส)
+        self.KS_COOLDOWN_SEC   = 60     # Base cooldown (Dynamic Regime-Aware จะปรับอัตโนมัติ)
+        # 🧭 DYNAMIC COOLDOWN — ปรับตาม Regime อัตโนมัติ (Priority 2 Active)
+        self.KS_COOLDOWN_CHOPPY   = 60   # CHOPPY: Liquidity กลับเร็ว
+        self.KS_COOLDOWN_TRENDING = 120  # TRENDING: รอ Momentum หมดแรงก่อน
+        self.KS_COOLDOWN_VOLATILE = 240  # VOLATILE: Capital Preservation สูงสุด
+        self.KS_COOLDOWN_WARMING  = 60   # WARMING (buffer ยังน้อย): ใช้ค่าเดิม
 
         # ⚖️ INVENTORY SKEW CONTROL — พอร์ตใกล้ Liq.
         self.INV_MAX_LAYERS    = 6      # ลดจาก 8 → หยุด DCA เร็วขึ้น
@@ -481,17 +509,41 @@ class MainCommandCenter:
                     and trade_obi_confirms_sell
                     and (now_flip - self._obi_flip_alerted) > flip_cooldown):
                 self._obi_flip_alerted = now_flip
+                _flip_cd = self._get_dynamic_cooldown()
+                _flip_regime, _ = self._get_regime()
                 asyncio.ensure_future(self.tg.send_message(
                     f"🚨 *OBI FLIP ALERT (Triple Verified)!*\n"
                     f"OBI ร่วงจาก `{obi_recent_max:+.2f}` → `{self._obi_score:+.2f}`\n"
                     f"📉 OFI: `{self._ofi_score:+.2f}` | Trade OBI: `{self._trade_obi:+.2f}`\n"
-                    f"🛡️ ชะลอระบบ 60 วินาที (แรงขายจริง ไม่ใช่ Spoof)"
+                    f"🧭 Regime: `{_flip_regime}` → ชะลอระบบ `{_flip_cd}s` (แรงขายจริง ไม่ใช่ Spoof)"
                 ))
                 self._kill_switch = True
-                self._kill_time = now_flip - (self.KS_COOLDOWN_SEC - 60)
+                self._kill_time = now_flip  # Dynamic cooldown จะคำนวณใน _check_kill_switch
                 self._kill_reason = f"Triple Verified Flip (OFI {self._ofi_score:+.2f} / TradeOBI {self._trade_obi:+.2f})"
                 _r, _rng = self._get_regime()
-                logger.warning(f"🚨 OBI FLIP TRIPLE-VERIFIED: {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} | Regime {_r}({_rng:.2f}%) | Pause 60s")
+                logger.warning(f"🚨 OBI FLIP TRIPLE-VERIFIED: {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} | Regime {_r}({_rng:.2f}%) | Cooldown {_flip_cd}s")
+
+                # 📓 FLIP LOGGER — บันทึก event นี้ และ schedule outcome check ใน 5 นาที
+                _flip_entry = {
+                    "time": now_flip,
+                    "obi_before": round(obi_recent_max, 3),
+                    "obi_after": round(self._obi_score, 3),
+                    "trade_obi": round(self._trade_obi, 3),
+                    "ofi": round(self._ofi_score, 3),
+                    "price": self.current_price,
+                    "regime": _flip_regime,
+                    "cooldown": _flip_cd,
+                    "outcome_price": None,
+                    "outcome_delta": None,
+                    "outcome_label": None,
+                }
+                self._flip_log.append(_flip_entry)
+                # Schedule outcome ใน 300 วินาที (5 นาที)
+                self._flip_pending_outcome.append({
+                    "entry_ref": _flip_entry,
+                    "check_at": now_flip + 300,
+                    "entry_price": self.current_price,
+                })
 
             # ── 2. OFI (Order Flow Imbalance) ────────────────────
             # OFI = +1 buy dominates, -1 sell dominates
@@ -847,6 +899,9 @@ class MainCommandCenter:
                 if not stats: await asyncio.sleep(5); continue
                 
                 inst_vol = (max(self.price_buffer) - min(self.price_buffer)) / min(self.price_buffer) * 100
+
+                # 📓 FLIP LOGGER — ตรวจ outcomes ที่ครบ 5 นาทีแล้ว
+                self._process_flip_outcomes()
 
                 # 🔴 KILL SWITCH CHECK
                 if await self._check_kill_switch(inst_vol, client):
@@ -1210,23 +1265,42 @@ class MainCommandCenter:
     # ─────────────────────────────────────────────────────────
     # 🔴 KILL SWITCH
     # ─────────────────────────────────────────────────────────
+    def _get_dynamic_cooldown(self) -> int:
+        """🧭 Dynamic Cooldown ตาม Regime (Priority 2 Active)
+        CHOPPY   → 60s  (Liquidity กลับเร็ว, ไม่เสียโอกาส)
+        TRENDING → 120s (รอ Momentum หมดแรงก่อน DCA)
+        VOLATILE → 240s (Capital Preservation สูงสุด)
+        WARMING  → 60s  (buffer ยังน้อย ใช้ค่าปลอดภัย)
+        """
+        regime, _ = self._get_regime()
+        cooldown_map = {
+            "CHOPPY":   self.KS_COOLDOWN_CHOPPY,
+            "TRENDING": self.KS_COOLDOWN_TRENDING,
+            "VOLATILE": self.KS_COOLDOWN_VOLATILE,
+            "WARMING":  self.KS_COOLDOWN_WARMING,
+        }
+        return cooldown_map.get(regime, self.KS_COOLDOWN_CHOPPY)
+
     async def _check_kill_switch(self, inst_vol: float, client) -> bool:
         """ตรวจสอบเงื่อนไข Kill Switch ทุก loop
         Returns True ถ้า kill switch active (ห้ามเทรด)
         """
         now = time.time()
 
-        # รอ cooldown ก่อนเปิดใหม่
+        # รอ cooldown ก่อนเปิดใหม่ — ใช้ Dynamic Cooldown ตาม Regime ปัจจุบัน
         if self._kill_switch:
-            if (now - self._kill_time) > self.KS_COOLDOWN_SEC:
+            dynamic_cd = self._get_dynamic_cooldown()
+            if (now - self._kill_time) > dynamic_cd:
                 self._kill_switch = False
                 self._kill_reason = ""
                 self._vol_spike_count = 0
-                logger.info("✅ Kill Switch released. Resuming trading.")
-                await self.tg.send_message("✅ *Kill Switch:* cooldown หมดแล้ว กลับมาเทรดปกติครับ")
+                regime, _ = self._get_regime()
+                logger.info(f"✅ Kill Switch released. Regime={regime}, Cooldown was {dynamic_cd}s")
+                await self.tg.send_message(f"✅ *Kill Switch:* cooldown หมดแล้ว กลับมาเทรดปกติครับ\n🧭 Regime: `{regime}` | Cooldown: `{dynamic_cd}s`")
             else:
-                remaining = int(self.KS_COOLDOWN_SEC - (now - self._kill_time))
-                logger.debug(f"🔴 Kill Switch active. Resume in {remaining}s")
+                dynamic_cd = self._get_dynamic_cooldown()
+                remaining = int(dynamic_cd - (now - self._kill_time))
+                logger.debug(f"🔴 Kill Switch active. Resume in {remaining}s (Regime Cooldown: {dynamic_cd}s)")
                 return True
 
         # ตรวจ volatility spike
@@ -1238,12 +1312,14 @@ class MainCommandCenter:
         if self._vol_spike_count >= self.KS_VOL_SPIKE_MAX:
             self._kill_switch = True
             self._kill_time = now
-            self._kill_reason = f"Volatility spike {inst_vol:.2f}% > {self.KS_VOL_THRESHOLD}%"
-            logger.critical(f"🔴 KILL SWITCH TRIGGERED: {self._kill_reason}")
+            dynamic_cd = self._get_dynamic_cooldown()
+            regime, _ = self._get_regime()
+            self._kill_reason = f"Volatility spike {inst_vol:.2f}% > {self.KS_VOL_THRESHOLD}% | Regime={regime}"
+            logger.critical(f"🔴 KILL SWITCH TRIGGERED: {self._kill_reason} | Cooldown {dynamic_cd}s")
             await self.tg.send_message(
                 f"🔴 *KILL SWITCH TRIGGERED!*\n"
                 f"เหตุผล: `{self._kill_reason}`\n"
-                f"บอทหยุดเทรดอีก `{self.KS_COOLDOWN_SEC//60}` นาที\n"
+                f"🧭 Regime: `{regime}` → Cooldown: `{dynamic_cd}s`\n"
                 f"คำสั่งที่เปิดอยู่จะถูกยกเลิกทั้งหมด"
             )
             await self._cancel_all_open_orders(client)
@@ -1259,6 +1335,85 @@ class MainCommandCenter:
             logger.info(f"🗑️ All open orders cancelled: {res}")
         except Exception as e:
             logger.error(f"Cancel Orders Error: {e}")
+
+    # ─────────────────────────────────────────────────────────
+    # 📓 FLIP LOGGER — Self-Learning Pattern Engine
+    # ─────────────────────────────────────────────────────────
+    def _process_flip_outcomes(self):
+        """เรียกทุก loop — ตรวจว่า pending outcome ไหนครบ 5 นาทีแล้ว
+        บันทึก outcome_delta และ label (BOUNCE/DUMP/FLAT) ลงใน flip_log
+        """
+        if not self._flip_pending_outcome:
+            return
+        now = time.time()
+        still_pending = []
+        for pending in self._flip_pending_outcome:
+            if now >= pending["check_at"] and self.current_price > 0:
+                entry_ref = pending["entry_ref"]
+                entry_price = pending["entry_price"]
+                outcome_price = self.current_price
+                delta_pct = (outcome_price - entry_price) / entry_price * 100
+                # Label: BOUNCE = ราคาขึ้น ≥ 0.1%, DUMP = ลง ≥ 0.1%, FLAT = อยู่ในกรอบ
+                if delta_pct >= 0.1:
+                    label = "BOUNCE"
+                elif delta_pct <= -0.1:
+                    label = "DUMP"
+                else:
+                    label = "FLAT"
+                entry_ref["outcome_price"] = round(outcome_price, 2)
+                entry_ref["outcome_delta"] = round(delta_pct, 4)
+                entry_ref["outcome_label"] = label
+                logger.info(
+                    f"📓 Flip Outcome [{label}]: "
+                    f"Regime={entry_ref['regime']} | "
+                    f"Price {entry_price:,.2f} → {outcome_price:,.2f} ({delta_pct:+.3f}%) | "
+                    f"TradeOBI={entry_ref['trade_obi']:+.2f}"
+                )
+            else:
+                still_pending.append(pending)
+        self._flip_pending_outcome = still_pending
+
+    def _get_flip_stats(self) -> str:
+        """สรุปสถิติ Flip Log — Win Rate แยกตาม Regime
+        คืน string สำหรับแสดงใน Dashboard หรือ Telegram
+        """
+        completed = [e for e in self._flip_log if e["outcome_label"] is not None]
+        if not completed:
+            return "📓 Flip Log: ยังไม่มีข้อมูลครบ 5 นาทีครับ"
+
+        # รวมสถิติแยกตาม Regime
+        from collections import defaultdict
+        stats: dict = defaultdict(lambda: {"BOUNCE": 0, "DUMP": 0, "FLAT": 0, "total": 0})
+        for e in completed:
+            r = e["regime"]
+            stats[r][e["outcome_label"]] += 1
+            stats[r]["total"] += 1
+
+        lines = [f"📓 *Flip Log Stats* ({len(completed)} events)"]
+        for regime, s in sorted(stats.items()):
+            total = s["total"]
+            bounce_rate = s["BOUNCE"] / total * 100
+            dump_rate = s["DUMP"] / total * 100
+            flat_rate = s["FLAT"] / total * 100
+            lines.append(
+                f"  `{regime}` → "
+                f"🟢 BOUNCE {bounce_rate:.0f}% | "
+                f"🔴 DUMP {dump_rate:.0f}% | "
+                f"⚪ FLAT {flat_rate:.0f}% "
+                f"(n={total})"
+            )
+
+        # แสดง 3 events ล่าสุด
+        lines.append("─ ล่าสุด 3 events ─")
+        for e in list(completed)[-3:]:
+            t = datetime.fromtimestamp(e["time"]).strftime("%H:%M")
+            lines.append(
+                f"  `{t}` [{e['regime']}] {e['outcome_label']} "
+                f"{e['outcome_delta']:+.3f}% | "
+                f"OBI {e['obi_before']:+.2f}→{e['obi_after']:+.2f} "
+                f"T:{e['trade_obi']:+.2f}"
+            )
+        return "\n".join(lines)
 
     # ─────────────────────────────────────────────────────────
     # ⚖️ INVENTORY SKEW CONTROL
