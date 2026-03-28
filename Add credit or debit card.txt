@@ -1,5 +1,0 @@
-Add credit or debit card
-Card number required  5323924132714262  
-Enter a valid expiry date  07/30  
-Security code is required  500  
- Cardholder name required  JEERAWAT PHONAD
