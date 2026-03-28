@@ -524,6 +524,7 @@ class MainCommandCenter:
                     and self._obi_score < -0.30
                     and self._ofi_score < -0.20
                     and trade_obi_confirms_sell
+                    and not self._kill_switch
                     and (now_flip - self._obi_flip_alerted) > flip_cooldown):
                 self._obi_flip_alerted = now_flip
                 _flip_cd = self._get_dynamic_cooldown()

@@ -412,6 +412,23 @@ Queue:       สูงสุด 10 ข้อความ
 
 ## 🚀 11. การเริ่มต้นใช้งาน
 
+### 11.0 Infrastructure (Production)
+บอทรันบน **Google Cloud Always Free VM** (ไม่มีค่าใช้จ่าย):
+
+| Field | Value |
+|---|---|
+| ชื่อเครื่อง | commander-v2-bot |
+| Region | us-west1-a (Oregon) |
+| Spec | e2-micro (2 vCPU / 1 GB RAM) |
+| OS | Ubuntu 22.04 LTS |
+| Disk | 30 GB |
+| External IP | 8.229.111.0 |
+
+```bash
+# SSH เข้าเครื่อง
+ssh <user>@8.229.111.0
+```
+
 ### 11.1 ติดตั้ง
 ```bash
 pip install -r configs/requirements.txt
@@ -460,7 +477,7 @@ pm2 restart bot
 
 ## 📝 13. Changelog
 
-### v2.0 (2026-03-28) — Current
+### v2.0 (2026-03-29) — Current (Production on GCP Always Free)
 
 **Priority 1: Trade-based OBI (OBI^T)**
 - `stream_aggtrade()` ใน `async_client.py` — WebSocket `btcusdt@aggTrade` ทุก 100ms
@@ -511,5 +528,5 @@ pm2 restart bot
 ---
 
 *COMMANDER v2.0 — Institutional-grade Microstructure Edition*
-*Stack: Python 3.10+ · asyncio · aiohttp · Binance Futures API (REST + WebSocket L2 + aggTrade)*
+*Stack: Python 3.10+ · asyncio · aiohttp · Binance Futures API (REST + WebSocket L2 + aggTrade) · pm2 · Ubuntu 22.04 LTS · Google Cloud e2-micro*
 *Concepts: OBI · OBI_deep · OFI · Trade OBI (OBI^T) · 3-Gate Spoof · Tiered Wall · 4-Gate OBI Flip · Dynamic Kill Switch · Regime Detector · Flip Logger · Auto-Monitor · Token Bucket*
