@@ -324,6 +324,7 @@ class MainCommandCenter:
         # {time, obi_before, obi_after, trade_obi, ofi, price, regime, cooldown,
         #  outcome_price (ราคา 5 นาทีหลัง), outcome_delta (%), outcome_label}
         self._flip_pending_outcome: list = []  # รอ record outcome หลัง 5 นาที
+        self._flip_log_path = "logs/flip_log.json"  # persist ข้ามรอบ restart
 
         # 📚 LOCAL ORDER BOOK (Binance standard sync)
         self._lob_bids: dict = {}        # {price: qty}
@@ -370,6 +371,7 @@ class MainCommandCenter:
 
     async def run(self):
         if not os.path.exists("logs"): os.makedirs("logs")
+        self._flip_log_load()
         async with self.client_gl as client:
             success = await self._init_setup(client)
             if not success:
@@ -1424,6 +1426,31 @@ class MainCommandCenter:
             else:
                 still_pending.append(pending)
         self._flip_pending_outcome = still_pending
+        self._flip_log_save()
+
+    def _flip_log_save(self):
+        """บันทึก flip_log ลงไฟล์ JSON — เฉพาะ events ที่ outcome ครบแล้ว"""
+        try:
+            import json
+            completed = [e for e in self._flip_log if e["outcome_label"] is not None]
+            with open(self._flip_log_path, "w") as f:
+                json.dump(completed, f)
+        except Exception as e:
+            logger.warning(f"📓 Flip log save error: {e}")
+
+    def _flip_log_load(self):
+        """โหลด flip_log จากไฟล์ JSON เมื่อ restart"""
+        try:
+            import json
+            if not os.path.exists(self._flip_log_path):
+                return
+            with open(self._flip_log_path, "r") as f:
+                data = json.load(f)
+            for e in data:
+                self._flip_log.append(e)
+            logger.info(f"📓 Flip log loaded: {len(data)} events จากไฟล์")
+        except Exception as e:
+            logger.warning(f"📓 Flip log load error: {e}")
 
     def _get_flip_stats(self) -> str:
         """สรุปสถิติ Flip Log — Win Rate แยกตาม Regime
