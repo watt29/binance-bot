@@ -30,7 +30,10 @@ class BinanceAsyncClient:
 
     async def __aenter__(self):
         if not self.session:
-            self.session = aiohttp.ClientSession(headers={"X-MBX-APIKEY": self.api_key})
+            headers: Dict[str, str] = {"X-MBX-APIKEY": self.api_key}
+            if self._use_cf_proxy and self.cf_proxy_secret:
+                headers["X-Proxy-Secret"] = self.cf_proxy_secret
+            self.session = aiohttp.ClientSession(headers=headers)
         return self
 
 
