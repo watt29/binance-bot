@@ -19,6 +19,12 @@ GL_API_KEY    = os.getenv("GL_API_KEY", "").strip()
 GL_API_SECRET = os.getenv("GL_API_SECRET", "").strip()
 BINANCE_PROXY = os.getenv("BINANCE_PROXY", "").strip() or None
 
+# --- [CLOUDFLARE WORKER PROXY] ---
+# ใช้เมื่อ VPS IP ถูก Binance block — มุดผ่าน Cloudflare edge แทน
+# ตั้ง CF_WORKER_URL ใน .env เพื่อเปิดใช้งาน (ถ้าว่าง = ไม่ใช้)
+CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "").strip() or None
+CF_PROXY_SECRET  = os.getenv("CF_PROXY_SECRET", "").strip() or None
+
 # --- DEBUG (ตรวจสอบความพร้อม) ---
 if __name__ == "__main__":
     print(f"--- Config Check ---")

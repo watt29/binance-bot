@@ -13,7 +13,7 @@ from datetime import datetime
 
 # 🛡️ SYSTEM CONFIG & LOGGING
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from shared.config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GL_API_KEY, GL_API_SECRET, BINANCE_PROXY  # pyre-ignore
+from shared.config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GL_API_KEY, GL_API_SECRET, BINANCE_PROXY, CF_WORKER_URL, CF_PROXY_SECRET  # pyre-ignore
 from binance_global.async_client import BinanceAsyncClient  # pyre-ignore
 
 logger.remove()
@@ -180,13 +180,15 @@ class TelegramCommander:
                     await self.bot.send_combined_report()
                 elif t in ("🔄 NORMAL", "🔄 ปล่อยแบบเดิม"):
                     self.bot.strategy_mode = "NORMAL"
+                    self.bot._equity_kill_active = False  # Reset Equity Kill Switch
                     await self.bot.update_strategy_parameters()
-                    await self.send_message("🔄 *NORMAL Mode:* บอทตัดสินใจตามตลาดเอง")
+                    await self.send_message("🔄 *NORMAL Mode:* บอทตัดสินใจตามตลาดเอง\n✅ Equity Kill Switch ถูก Reset แล้วครับ")
                     await self.bot.send_combined_report()
                 # ── ควบคุม Bot ──
                 elif t in ("⏸️ หยุด", "⏸️ หยุดชั่วคราว"):
                     await self.bot.set_pause(True)
                 elif t in ("▶️ รันต่อ", "▶️ เริ่มรันต่อ"):
+                    self.bot._equity_kill_active = False  # Reset Equity Kill Switch
                     await self.bot.set_pause(False)
                 elif t in ("💥 ปิด Position", "💥 ปิดทุกออเดอร์"):
                     await self.bot.emergency_close()
@@ -267,7 +269,14 @@ class TelegramCommander:
 
 class MainCommandCenter:
     def __init__(self):
-        self.client_gl = BinanceAsyncClient(GL_API_KEY, GL_API_SECRET, proxy=BINANCE_PROXY)
+        self.client_gl = BinanceAsyncClient(
+            GL_API_KEY, GL_API_SECRET,
+            proxy=BINANCE_PROXY,
+            cf_worker_url=CF_WORKER_URL,
+            cf_proxy_secret=CF_PROXY_SECRET,
+        )
+        if CF_WORKER_URL:
+            logger.info(f"🌐 Cloudflare Worker Proxy ENABLED: {CF_WORKER_URL}")
         self.tg = TelegramCommander(self)
         self.symbol, self.gl_paused, self.leverage = "BTCUSDT", False, 15
         self.grid_step_pct, self.target_net_profit_pct = 0.5, 1.2
@@ -345,13 +354,54 @@ class MainCommandCenter:
         self.KS_COOLDOWN_SEC   = 60     # Base cooldown (Dynamic Regime-Aware จะปรับอัตโนมัติ)
         # 🧭 DYNAMIC COOLDOWN — ปรับตาม Regime อัตโนมัติ (Priority 2 Active)
         self.KS_COOLDOWN_CHOPPY   = 60   # CHOPPY: Liquidity กลับเร็ว
-        self.KS_COOLDOWN_TRENDING = 120  # TRENDING: รอ Momentum หมดแรงก่อน
+        self.KS_COOLDOWN_TRENDING = 300  # TRENDING: รอ Momentum หมดแรงก่อน (เพิ่มจาก 120→300s)
         self.KS_COOLDOWN_VOLATILE = 240  # VOLATILE: Capital Preservation สูงสุด
         self.KS_COOLDOWN_WARMING  = 60   # WARMING (buffer ยังน้อย): ใช้ค่าเดิม
+
+        # 🧭 DYNAMIC REGIME & CUSUM VARS
+        self._cusum_pos = 0.0
+        self._cusum_neg = 0.0
+        self._safe_bar_count = 0
+        self.CUSUM_K = 1.5
+        self.CUSUM_H = 5.0
+        self._cooldown_state = "READY"
 
         # ⚖️ INVENTORY SKEW CONTROL — พอร์ตใกล้ Liq.
         self.INV_MAX_LAYERS    = 6      # ลดจาก 8 → หยุด DCA เร็วขึ้น
         self.INV_MAX_LOSS_PCT  = 40.0   # ขาดทุน > 40% margin = toxic (ปรับตามสภาพจริง)
+
+        # 🛡️ EQUITY KILL SWITCH — หยุดเปิดไม้ใหม่เมื่อ Drawdown เกินเกณฑ์
+        self.EQUITY_DRAWDOWN_LIMIT = -0.30  # PNL% ของ Balance ติดลบเกิน 30% → จำศีล
+        self._equity_kill_active = False     # True = ล็อค DCA จนกว่า User จะ Reset
+        self.EMERGENCY_BAL_LIMIT = 30.0      # Available < $30 → Block DCA ทันที
+
+        # 📐 DYNAMIC LOT SIZING — ลด Lot ตาม Layer (Downward Protection)
+        # Layer 1-5: 100% | 6-7: 75% | 8-9: 50% | 10+: 30%
+        self.LOT_SCALE_BY_LAYER = {0: 1.0, 6: 0.75, 8: 0.50, 10: 0.30}
+
+        # 🌡️ VOLATILITY GATE (σ/μ Ratio) — ตรวจ Regime จาก price buffer
+        # σ/μ > 5.0 = CHOPPY (ปลอดภัย) | < 5.0 = TRENDING (อันตราย)
+        self.VGATE_SIGMA_MU_MIN = 5.0   # เกณฑ์ขั้นต่ำ
+        self.VGATE_REARM_BARS  = 3      # ต้องผ่าน σ/μ > 5.0 ติดต่อกัน 3 รอบ ถึง Re-arm
+        self._vgate_safe_count = 0      # นับรอบที่ปลอดภัยติดต่อกัน
+        self._vgate_blocked    = False  # True = VolatilityGate บล็อก DCA ไว้
+        self._vgate_price_history: list = []  # เก็บ price สำหรับคำนวณ MA drift
+
+        # ⏳ VARIANCE AGE EXIT — บังคับปิด Position หากถือนานเกิน 72 ชั่วโมง
+        self.AGE_EXIT_HOURS   = 72      # ชั่วโมงสูงสุดที่ถือ Position ไว้
+        self._position_open_time = 0.0  # timestamp ที่เปิด Position
+
+        # 📅 MAX DAILY LOSS — หยุดเทรดทั้งวันเมื่อขาดทุนสะสมถึงเกณฑ์ (Prop Firm style)
+        self.MAX_DAILY_LOSS    = -50.0  # ขาดทุนสะสม > $50/วัน → หยุดทั้งวัน
+        self._daily_loss_total = 0.0    # สะสม PnL ที่ปิดแล้ว (Realized) วันนี้
+        self._daily_loss_date  = ""     # วันที่ล่าสุดที่ reset (YYYY-MM-DD)
+        self._daily_kill_active = False # True = หยุดเทรดจนถึงเที่ยงคืน
+
+        # ⚡ RAPID-FIRE ORDER THROTTLE — บล็อกเมื่อส่ง order มากเกินในเวลาสั้น
+        self.THROTTLE_MAX_ORDERS = 3    # สูงสุด 3 orders ใน 60 วินาที
+        self.THROTTLE_WINDOW_SEC = 60   # time window
+        self._order_timestamps: list = []  # เก็บ timestamp ของ orders ล่าสุด
+        self._throttle_blocked  = False # True = ถูกบล็อก
 
         # 🤖 AUTO-MONITOR (Cipher Logic Built-in)
         self._monitor_interval = 60        # เช็คทุก 1 นาที (วิกฤต — ลด Liq. ใกล้)
@@ -885,7 +935,9 @@ class MainCommandCenter:
 
             # --- APPLY STRATEGY MODIFIERS ---
             if self.strategy_mode == "SAFE":
-                self.grid_step_pct *= 1.5  # ถอยระยะไม้ห่างขึ้น 50%
+                # Layer 10+ วิกฤต: ขยาย Grid Step 200% เพื่อรอ Mean-reversion ที่ไกลกว่า
+                safe_mult = 3.0 if self.active_layers >= 10 else 1.5
+                self.grid_step_pct *= safe_mult
                 self.target_net_profit_pct = (0.10 + (self.grid_step_pct * 0.15)) * self.leverage
             elif self.strategy_mode == "PROFIT":
                 self.target_net_profit_pct = (0.10 + (self.grid_step_pct * 0.10)) * self.leverage
@@ -940,20 +992,28 @@ class MainCommandCenter:
                 usdt = next((a for a in acc['assets'] if a['asset'] == 'USDT'), None)  # pyre-ignore
                 w_bal, a_bal = (safe_float(usdt['walletBalance']), safe_float(usdt['availableBalance'])) if usdt else (0.0, 0.0)  # pyre-ignore
                 # 🚀 UPGRADED LOT CALCULATION: Supporting recovery for $300-$500 balance
-                lot_u = max(200.0, min((w_bal * 0.8 / 5) * self.leverage, 500.0))
+                base_lot_u = max(200.0, min((w_bal * 0.8 / 5) * self.leverage, 500.0))
+                lot_scale = self._get_lot_scale()  # 📐 Dynamic Lot Sizing ตาม Layer
+                lot_u = base_lot_u * lot_scale
                 
                 pos = next((p for p in acc['positions'] if p['symbol'] == self.symbol), None)  # pyre-ignore
                 p_amt = safe_float(pos['positionAmt']) if pos else 0.0
                 entry_p = safe_float(pos['entryPrice']) if pos else 0.0
                 
+                # 🌡️ VolatilityGate: ตรวจ σ/μ ratio ทุก loop
+                vgate_ok = self._check_volatility_gate(cur_p)
+                # 📅 Daily Loss: reset เมื่อขึ้นวันใหม่
+                self._reset_daily_loss_if_new_day()
+
                 if p_amt == 0:
                     self.active_layers, self.trailing_active, self.last_buy_price = 0, False, 0.0
+                    self._position_open_time = 0.0  # Reset age timer
                     if (time.time() - self.last_close_time) > 60:
                         p_range = (cur_p - stats['low']) / (stats['high'] - stats['low']) * 100 if stats['high'] > stats['low'] else 50  # pyre-ignore
                         # 📊 OBI+OFI Filter: ไม่เปิดไม้แรกถ้าแรงขายหนักมาก และ OFI ยืนยัน
                         # Deep OBI (Top 5 + distance-weighted) ยืนยันว่าแรงขายจริงไม่ใช่ Spoof จากระดับไกล
                         obi_ok = (self._obi_score >= -0.3 or self._obi_last_update == 0) and self._obi_confirmed() and (self._obi_deep >= -0.35 or self._obi_last_update == 0)
-                        if p_range < 85 and inst_vol < 0.4 and obi_ok:
+                        if p_range < 85 and inst_vol < 0.4 and obi_ok and vgate_ok and not self._daily_kill_active:
                             if a_bal >= (lot_u / self.leverage): await self._execute_trade(client, "BUY", lot_u)
                 else:
                     self.active_layers = max(1, int(round((abs(p_amt) * entry_p) / lot_u)))
@@ -967,12 +1027,32 @@ class MainCommandCenter:
                             self.strategy_mode = "SAFE"
                             logger.info(f"🔄 Mode recovered → SAFE (Layer {self.active_layers}/12)")
 
+                    # ⏳ บันทึกเวลาเปิด Position (สำหรับ Age Exit)
+                    if self._position_open_time <= 0:
+                        self._position_open_time = time.time()
+
+                    # ⏳ VARIANCE AGE EXIT: บังคับปิดถ้าถือเกิน AGE_EXIT_HOURS
+                    age_hours = (time.time() - self._position_open_time) / 3600
+                    if self._position_open_time > 0 and age_hours >= self.AGE_EXIT_HOURS:
+                        logger.warning(f"⏳ AGE EXIT: Position ถือมา {age_hours:.1f} ชั่วโมง (> {self.AGE_EXIT_HOURS}h) → บังคับปิดเพื่อ Variance Reset")
+                        await self.tg.send_message(
+                            f"⏳ *VARIANCE AGE EXIT*\n"
+                            f"Position ถือมา `{age_hours:.1f}` ชั่วโมง (เกิน `{self.AGE_EXIT_HOURS}h`)\n"
+                            f"บอทบังคับปิดเพื่อ Reset ความเสี่ยงครับ — PNL: `${safe_float(pos['unrealizedProfit']):.2f}`"
+                        )
+                        await self._execute_trade(client, "SELL", abs(p_amt), True)
+                        self.last_close_time = time.time()
+                        self.active_layers, self.trailing_active, self._position_open_time = 0, False, 0.0
+                        self._monitor_last_alert = {"type": None, "pnl": 0.0, "layers": 0}
+                        await asyncio.sleep(5)
+                        continue
+
                     # 🚀 [HOTFIX] ฟื้นฟู Session: ถ้าบอทเพิ่งเปิดใหม่และมีของติดลบอยู่ ห้ามคำนวณจาก entry_p เด็ดขาด!
                     if self.last_buy_price <= 0:
                         self.last_buy_price = cur_p
                         logger.info("🔄 Recovered Session: Set last_buy_price to current price to prevent instant duplicate buy.")
 
-                    logger.info(f"📊 Calc: Amt {p_amt} * Entry {entry_p} / Lot {lot_u} = Layers {self.active_layers}")
+                    logger.info(f"📊 Calc: Amt {p_amt} * Entry {entry_p} / Lot {lot_u:.0f} (scale {lot_scale:.0%}) = Layers {self.active_layers}")
                     layer_mult = 1.0 + (max(0, self.active_layers - 3) * 0.25)
                     final_step = self.grid_step_pct * layer_mult
                     
@@ -1004,11 +1084,44 @@ class MainCommandCenter:
                                 )
                                 self._last_report_time = time.time()
 
+                    # 🛡️ EQUITY KILL SWITCH: ตรวจ Drawdown และ Emergency Balance ก่อน DCA
+                    pnl_usdt_check = safe_float(pos['unrealizedProfit']) if pos else 0.0
+                    equity_drawdown_pct = pnl_usdt_check / max(a_bal + abs(pnl_usdt_check), 1.0)
+                    if not self._equity_kill_active and equity_drawdown_pct <= self.EQUITY_DRAWDOWN_LIMIT:
+                        self._equity_kill_active = True
+                        logger.warning(f"🛡️ EQUITY KILL: Drawdown {equity_drawdown_pct*100:.1f}% เกิน {self.EQUITY_DRAWDOWN_LIMIT*100:.0f}% → หยุด DCA + ยกเลิก Orders ทั้งหมด")
+                        try:
+                            await client.cancel_all_open_orders(self.symbol)
+                            logger.info("🛡️ Cancel All Open Orders สำเร็จ (Equity Kill)")
+                        except Exception as ce:
+                            logger.warning(f"🛡️ Cancel Orders failed: {ce}")
+                        await self.tg.send_message(
+                            f"🛡️ *EQUITY KILL SWITCH ACTIVE*\n"
+                            f"Drawdown: `{equity_drawdown_pct*100:.1f}%` เกิน `{self.EQUITY_DRAWDOWN_LIMIT*100:.0f}%`\n"
+                            f"PNL: `${pnl_usdt_check:.2f}` | Balance: `${a_bal:.2f}`\n"
+                            f"🚫 ยกเลิก Open Orders ทั้งหมดแล้ว\n"
+                            f"⚠️ บอทหยุด DCA จนกว่าจะสั่ง `🔄 NORMAL` หรือ `▶️ รันต่อ` ครับ"
+                        )
+
                     # Deep OBI gate เพิ่มความแม่นยำ แต่ bypass เมื่อ layer สูง (≥10) เพราะต้อง DCA ต่อ
                     obi_dca_ok = (self._obi_score >= -0.3 and self._obi_confirmed() and self._obi_deep >= -0.35) or self.active_layers >= 10 or self._obi_last_update == 0
                     if cur_p <= self.next_buy_price and self.active_layers < 12 and obi_dca_ok:
-                        logger.info(f"🔮 Prediction: Buy @ {self.next_buy_price:.1f} -> New Avg {self.predicted_avg_price:.1f} | OBI {self._obi_score:+.2f}")
-                        if a_bal >= (lot_u / self.leverage):
+                        logger.info(f"🔮 Prediction: Buy @ {self.next_buy_price:.1f} -> New Avg {self.predicted_avg_price:.1f} | OBI {self._obi_score:+.2f} | Lot Scale {lot_scale:.0%}")
+                        # 🛡️ Block DCA ตามลำดับความสำคัญ
+                        if self._daily_kill_active:
+                            logger.warning(f"📅 DCA BLOCKED (Daily Kill): ขาดทุนสะสม ${self._daily_loss_total:.2f} — หยุดทั้งวัน")
+                        elif self._check_order_throttle():
+                            pass  # log อยู่ใน _check_order_throttle แล้ว
+                        elif self._equity_kill_active:
+                            logger.warning(f"🛡️ DCA BLOCKED (Equity Kill Active): Layer {self.active_layers}, Drawdown {equity_drawdown_pct*100:.1f}%")
+                        elif not vgate_ok:
+                            logger.warning(f"🌡️ DCA BLOCKED (VolatilityGate): σ/μ ต่ำ → Trending detected, รอ Re-arm {self.VGATE_REARM_BARS} bars")
+                        elif a_bal < self.EMERGENCY_BAL_LIMIT:
+                            logger.warning(f"🛡️ DCA BLOCKED (Emergency Balance ${a_bal:.2f} < ${self.EMERGENCY_BAL_LIMIT}): รักษา Margin ไว้ก่อน")
+                            if (time.time() - self._last_report_time) > 300:
+                                await self.tg.send_message(f"🛡️ *EMERGENCY BALANCE LOCK*\nAvailable: `${a_bal:.2f}` (ต่ำกว่า `${self.EMERGENCY_BAL_LIMIT}`)\nบอทหยุด DCA เพื่อรักษา Margin ครับ")
+                                self._last_report_time = time.time()
+                        elif a_bal >= (lot_u / self.leverage):
                             await self._execute_trade(client, "BUY", lot_u)
                         else:
                             logger.warning(f"⚠️ Insufficient Balance to DCA: Need ${(lot_u / self.leverage):.2f} USDT, but have ${a_bal:.2f} USDT Available.")
@@ -1067,8 +1180,20 @@ class MainCommandCenter:
             
             res = await client.create_order(self.symbol, side, **params)
             if res and res.get('orderId'):
+                # ⚡ บันทึก timestamp สำหรับ Rapid-Fire Throttle
+                self._order_timestamps.append(time.time())
                 if is_close:
                     self.last_close_time = time.time()
+                    # 📅 บันทึก Realized PnL สำหรับ Daily Loss Tracker
+                    # ประมาณ PnL = (cur_p - entry_p) * qty * leverage (sign = side)
+                    try:
+                        acc_snap = await self._get_cached_account(force=True)
+                        pos_snap = next((p for p in acc_snap.get('positions', []) if p['symbol'] == self.symbol), None) if acc_snap else None
+                        realized = safe_float(pos_snap.get('realizedProfit', 0)) if pos_snap else 0.0
+                        if realized != 0.0:
+                            self._record_realized_pnl(realized)
+                    except Exception:
+                        pass
                 else:
                     self.last_buy_price = cur_p
                 await self.tg.send_message(f"{'🔴 ปิด' if is_close else '🔵 เปิด (GTX)'} สำเร็จ!")
@@ -1325,6 +1450,114 @@ class MainCommandCenter:
         self._lob_prev_u = u
 
     # ─────────────────────────────────────────────────────────
+    # 📅 MAX DAILY LOSS & RAPID-FIRE THROTTLE
+    # ─────────────────────────────────────────────────────────
+    def _reset_daily_loss_if_new_day(self):
+        """Reset daily loss counter เมื่อถึงวันใหม่ (UTC)"""
+        import datetime
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if self._daily_loss_date != today:
+            self._daily_loss_date  = today
+            self._daily_loss_total = 0.0
+            self._daily_kill_active = False
+            logger.info(f"📅 Daily Loss Reset: วันใหม่ {today} — เคาน์เตอร์รีเซ็ตแล้ว")
+
+    def _record_realized_pnl(self, pnl: float):
+        """บันทึก Realized PnL หลังปิด Position — เรียกจาก _execute_trade is_close=True"""
+        self._reset_daily_loss_if_new_day()
+        self._daily_loss_total += pnl
+        logger.info(f"📅 Daily PnL: ${self._daily_loss_total:.2f} (added ${pnl:+.2f})")
+        if not self._daily_kill_active and self._daily_loss_total <= self.MAX_DAILY_LOSS:
+            self._daily_kill_active = True
+            logger.critical(f"📅 MAX DAILY LOSS HIT: ${self._daily_loss_total:.2f} ≤ ${self.MAX_DAILY_LOSS} → หยุดเทรดทั้งวัน")
+            asyncio.ensure_future(self.tg.send_message(
+                f"📅 *MAX DAILY LOSS — TRADING HALTED*\n"
+                f"ขาดทุนสะสมวันนี้: `${self._daily_loss_total:.2f}`\n"
+                f"เกินเกณฑ์: `${self.MAX_DAILY_LOSS}`\n"
+                f"⛔ บอทหยุดเทรดจนถึงเที่ยงคืน UTC ครับ"
+            ))
+
+    def _check_order_throttle(self) -> bool:
+        """Rapid-Fire Throttle: บล็อกเมื่อส่ง order > THROTTLE_MAX_ORDERS ใน THROTTLE_WINDOW_SEC
+        Returns True ถ้าถูก throttle (ห้ามส่ง order)
+        """
+        now = time.time()
+        # ลบ timestamp ที่พ้น window ออก
+        self._order_timestamps = [t for t in self._order_timestamps if now - t <= self.THROTTLE_WINDOW_SEC]
+        if len(self._order_timestamps) >= self.THROTTLE_MAX_ORDERS:
+            if not self._throttle_blocked:
+                self._throttle_blocked = True
+                oldest = self._order_timestamps[0] if self._order_timestamps else now
+                resume_in = int(self.THROTTLE_WINDOW_SEC - (now - oldest))
+                logger.warning(f"⚡ RAPID-FIRE THROTTLE: {len(self._order_timestamps)} orders ใน {self.THROTTLE_WINDOW_SEC}s → บล็อก {resume_in}s")
+                asyncio.ensure_future(self.tg.send_message(
+                    f"⚡ *RAPID-FIRE THROTTLE ACTIVE*\n"
+                    f"ส่ง `{len(self._order_timestamps)}` orders ใน `{self.THROTTLE_WINDOW_SEC}s`\n"
+                    f"บล็อกอีก ~`{resume_in}s` เพื่อป้องกันระบบทำงานผิดปกติ"
+                ))
+            return True
+        self._throttle_blocked = False
+        return False
+
+    # ─────────────────────────────────────────────────────────
+    # 📐 DYNAMIC LOT SIZING & VOLATILITY GATE
+    # ─────────────────────────────────────────────────────────
+    def _get_lot_scale(self) -> float:
+        """คืนค่า multiplier ของ Lot ตาม Layer ปัจจุบัน (Downward Protection)
+        Layer 1-5: 100% | 6-7: 75% | 8-9: 50% | 10+: 30%
+        """
+        layer = self.active_layers
+        scale = 1.0
+        for threshold, s in sorted(self.LOT_SCALE_BY_LAYER.items(), reverse=True):
+            if layer >= threshold:
+                scale = s
+                break
+        return scale
+
+    def _check_volatility_gate(self, cur_p: float) -> bool:
+        """VolatilityGate: คำนวณ σ/μ ratio จาก price buffer
+        Returns True ถ้าปลอดภัย (CHOPPY), False ถ้าบล็อก (TRENDING)
+
+        σ = std dev ของ price changes (ความผันผวน)
+        μ = mean absolute MA change (ทิศทาง Drift)
+        σ/μ > VGATE_SIGMA_MU_MIN = CHOPPY (OK) | < threshold = TRENDING (BLOCK)
+        """
+        self._vgate_price_history.append(cur_p)
+        if len(self._vgate_price_history) > 20:
+            self._vgate_price_history.pop(0)
+
+        hist = self._vgate_price_history
+        if len(hist) < 10:
+            return True  # ข้อมูลยังน้อย → ไม่บล็อก
+
+        # คำนวณ σ: std dev ของ log returns
+        returns = [(hist[i] - hist[i-1]) / hist[i-1] for i in range(1, len(hist))]
+        mean_r = sum(returns) / len(returns)
+        sigma = (sum((r - mean_r)**2 for r in returns) / len(returns)) ** 0.5
+
+        # คำนวณ μ: mean absolute MA change (5-bar MA)
+        ma = [sum(hist[max(0,i-4):i+1]) / min(5, i+1) for i in range(len(hist))]
+        mu = sum(abs(ma[i] - ma[i-1]) / ma[i-1] for i in range(1, len(ma))) / max(len(ma)-1, 1)
+
+        ratio = sigma / mu if mu > 1e-8 else 999.0
+
+        was_blocked = self._vgate_blocked
+        if ratio >= self.VGATE_SIGMA_MU_MIN:
+            self._vgate_safe_count += 1
+            if self._vgate_safe_count >= self.VGATE_REARM_BARS:
+                self._vgate_blocked = False
+        else:
+            self._vgate_safe_count = 0
+            self._vgate_blocked = True
+
+        if was_blocked and not self._vgate_blocked:
+            logger.info(f"✅ VolatilityGate Re-armed: σ/μ={ratio:.1f} ≥ {self.VGATE_SIGMA_MU_MIN} ({self.VGATE_REARM_BARS} bars ติดต่อกัน)")
+        elif not was_blocked and self._vgate_blocked:
+            logger.warning(f"🌡️ VolatilityGate BLOCKED: σ/μ={ratio:.2f} < {self.VGATE_SIGMA_MU_MIN} → Trending detected")
+
+        return not self._vgate_blocked
+
+    # ─────────────────────────────────────────────────────────
     # 🔴 KILL SWITCH
     # ─────────────────────────────────────────────────────────
     def _get_dynamic_cooldown(self) -> int:
@@ -1348,22 +1581,61 @@ class MainCommandCenter:
         Returns True ถ้า kill switch active (ห้ามเทรด)
         """
         now = time.time()
+        regime, rng = self._get_regime()
+        
+        # 1. Update CUSUM Breakout
+        if len(self.price_buffer) >= 2:
+            import numpy as np
+            price_diffs = np.diff(list(self.price_buffer))
+            vol = np.std(price_diffs)
+            z = price_diffs[-1] / (vol if vol > 1e-8 else 1.0)
+            self._cusum_pos = max(0, self._cusum_pos + z - self.CUSUM_K)
+            self._cusum_neg = max(0, self._cusum_neg - z - self.CUSUM_K)
+            
+            # CUSUM Fires -> บังคับ Trigger Block (TRENDING)
+            if not self._kill_switch and (self._cusum_pos > self.CUSUM_H or self._cusum_neg > self.CUSUM_H):
+                self._kill_switch = True
+                self._kill_time = now
+                self._kill_reason = f"CUSUM Breakout! (Trend detected, Pos:{self._cusum_pos:.1f} Neg:{self._cusum_neg:.1f})"
+                self._cusum_pos = 0.0
+                self._cusum_neg = 0.0
+                dynamic_cd = self._get_dynamic_cooldown()
+                logger.critical(f"🚨 CUSUM BLOCK TRIGGERED: {self._kill_reason} | Cooldown {dynamic_cd}s")
+                await self.tg.send_message(f"🚨 *CUSUM Breakout Block!*\nตรวจพบตลาดกำลังสร้างเทรนด์ (Trending Regime)\nเหตุผล: `{self._kill_reason}`\nระยะเวลาพัก: `{dynamic_cd}s`\nคำสั่งที่เปิดอยู่จะถูกยกเลิกทั้งหมดเพื่อป้องกันรับมีด!")
+                await self._cancel_all_open_orders(client)
+                return True
 
         # รอ cooldown ก่อนเปิดใหม่ — ใช้ Dynamic Cooldown ตาม Regime ปัจจุบัน
         if self._kill_switch:
             dynamic_cd = self._get_dynamic_cooldown()
+            # Full Cooldown Recovery (ต้องพ้นระยะเวลา + ตลาดเป็น CHOPPY ถึงจะปลดให้)
             if (now - self._kill_time) > dynamic_cd:
-                self._kill_switch = False
-                self._kill_reason = ""
-                self._vol_spike_count = 0
-                regime, _ = self._get_regime()
-                logger.info(f"✅ Kill Switch released. Regime={regime}, Cooldown was {dynamic_cd}s")
-                await self.tg.send_message(f"✅ *Kill Switch:* cooldown หมดแล้ว กลับมาเทรดปกติครับ\n🧭 Regime: `{regime}` | Cooldown: `{dynamic_cd}s`")
+                if regime == "CHOPPY" or self.KS_COOLDOWN_VOLATILE > 0: # ปลดถ้าตลาดอยู่ในเกณฑ์
+                    self._kill_switch = False
+                    self._kill_reason = ""
+                    self._vol_spike_count = 0
+                    self._safe_bar_count = 0
+                    logger.info(f"✅ Full Cooldown Recovery released. Regime={regime}")
+                    await self.tg.send_message(f"✅ *Kill Switch Released:* หมดเวลายับยั้งและตลาดฟื้นตัวอยู่ในเกณฑ์ที่ตั้งไว้ครับ\n🧭 Regime: `{regime}`")
             else:
-                dynamic_cd = self._get_dynamic_cooldown()
                 remaining = int(dynamic_cd - (now - self._kill_time))
-                logger.debug(f"🔴 Kill Switch active. Resume in {remaining}s (Regime Cooldown: {dynamic_cd}s)")
+                logger.debug(f"🔴 Kill Switch active (Block). Resume in {remaining}s (Regime: {regime})")
                 return True
+
+        # 2. ป้องกัน Noise และสวิงใน Choppy ด้วย OFI Filter 
+        # (หยุดพักชั่วคราว รอคอนเฟิร์ม N แท่ง)
+        if regime == "CHOPPY" and self.active_layers == 0:
+            if abs(self._ofi_score) > 0.35: # มีแรงไม่สมดุลชัดเจน (Stabilizer)
+                self._safe_bar_count += 1
+            else:
+                self._safe_bar_count = 0 # เป็นแค่ Noise ให้ Reset เคาต์ดาวน์
+
+            if self._safe_bar_count < 3:
+                self._cooldown_state = "PAUSED"
+                logger.debug(f"🟡 CHOPPY PAUSED: รอ OFI ยืนยัน {self._safe_bar_count}/3 แท่งต่อเนื่อง ป้องกันสัญญาณหลอก")
+                return True
+            else:
+                self._cooldown_state = "READY"
 
         # ตรวจ volatility spike
         if inst_vol > self.KS_VOL_THRESHOLD:
@@ -1537,22 +1809,37 @@ class MainCommandCenter:
         return (obi > 0 and ofi > -0.35) or (obi < 0 and ofi < 0.35)
 
     def _get_regime(self) -> tuple:
-        """[Read-Only Diagnostics] ตรวจจับสภาวะตลาดจาก price_buffer
-        คืน (regime: str, range_pct: float) — ไม่เปลี่ยน behavior บอทเลย
-        ใช้ข้อมูลที่มีถ้า buffer >= 2 (ไม่รอครบ 8 แล้ว)
-        """
+        """[Read-Only Diagnostics] ตรวจจับสภาวะตลาดจาก price_buffer (Sigma/Mu Ratio)"""
         try:
             if len(self.price_buffer) < 2:
                 return "WARMING", 0.0
-            lo = min(self.price_buffer)
-            if lo <= 0:
+            
+            import numpy as np
+            price_diffs = np.diff(list(self.price_buffer))
+            if len(price_diffs) == 0:
                 return "WARMING", 0.0
-            rng = (max(self.price_buffer) - lo) / lo * 100
-            if rng < 0.15:
-                return "CHOPPY", rng
-            if rng > 0.8:
-                return "VOLATILE", rng
-            return "TRENDING", rng
+
+            drift = np.mean(price_diffs)
+            vol = np.std(price_diffs)
+            
+            lo = min(self.price_buffer)
+            rng = (max(self.price_buffer) - lo) / lo * 100 if lo > 0 else 0.0
+
+            # Volatility vs Drift Ratio
+            if abs(drift) > 1e-8:
+                ratio = vol / abs(drift)
+            else:
+                ratio = float('inf')
+
+            # กำหนด Regime
+            if ratio > 2.5:
+                regime = "CHOPPY"
+            elif rng > 0.8:
+                regime = "VOLATILE"
+            else:
+                regime = "TRENDING"
+                
+            return regime, rng
         except Exception:
             return "ERROR", 0.0
 

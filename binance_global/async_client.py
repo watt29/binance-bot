@@ -8,15 +8,24 @@ from typing import Dict, Any, Optional
 from loguru import logger # pyre-ignore
 
 class BinanceAsyncClient:
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://fapi.binance.com", proxy: Optional[str] = None):
+    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://fapi1.binance.com", proxy: Optional[str] = None,
+                 cf_worker_url: Optional[str] = None, cf_proxy_secret: Optional[str] = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url
-        self.proxy = proxy # Support for QuotaGuard or other Static IP Proxies
+        self.proxy = proxy  # Support for QuotaGuard or other Static IP Proxies
+
+        # 🌐 Cloudflare Worker Proxy — มุด IP ผ่าน CF edge เมื่อ Binance block VPS IP
+        # cf_worker_url  = "https://binance-proxy.regency2919.workers.dev/proxy"
+        # cf_proxy_secret = "commander_proxy_secret_2026"
+        self.cf_worker_url    = cf_worker_url.rstrip("/") if cf_worker_url else None
+        self.cf_proxy_secret  = cf_proxy_secret
+        self._use_cf_proxy    = bool(cf_worker_url)  # True = ส่งทุก request ผ่าน CF Worker
+
         self.session: Optional[aiohttp.ClientSession] = None
         self._backoff_until = 0.0
-        self.used_weight_1m = 0 
-        self.weight_limit = 2400 
+        self.used_weight_1m = 0
+        self.weight_limit = 2400
         self._last_weight_update = 0.0
 
     async def __aenter__(self):
@@ -64,10 +73,17 @@ class BinanceAsyncClient:
 
         session: aiohttp.ClientSession = self.session  # type: ignore[assignment]
         if session is None or session.closed:
-            session = aiohttp.ClientSession(headers={"X-MBX-APIKEY": self.api_key})
+            headers: Dict[str, str] = {"X-MBX-APIKEY": self.api_key}
+            if self._use_cf_proxy and self.cf_proxy_secret:
+                headers["X-Proxy-Secret"] = self.cf_proxy_secret
+            session = aiohttp.ClientSession(headers=headers)
             self.session = session
 
-        url = f"{self.base_url}{path}"
+        # 🌐 Cloudflare Worker Proxy: เปลี่ยน URL target ไปที่ CF Worker
+        if self._use_cf_proxy:
+            url = f"{self.cf_worker_url}{path}"
+        else:
+            url = f"{self.base_url}{path}"
         params = params or {}
         request_params = {k: (str(v).lower() if isinstance(v, bool) else v) for k, v in params.items()}
         
@@ -174,6 +190,10 @@ class BinanceAsyncClient:
             if "timeInForce" not in params:
                 params["timeInForce"] = "GTC"
         return await self._request("POST", "/fapi/v1/order", signed=True, params=params, priority=0)
+
+    async def cancel_all_open_orders(self, symbol: str):
+        """ยกเลิก Open Orders ทั้งหมดของ symbol — ใช้เมื่อ Kill Switch / Equity Lock เกิดขึ้น"""
+        return await self._request("DELETE", "/fapi/v1/allOpenOrders", signed=True, params={"symbol": symbol}, priority=0)
 
     # --- User Data Stream ---
     async def futures_stream_get_listen_key(self):

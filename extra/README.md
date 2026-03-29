@@ -1,5 +1,5 @@
 # 🏰 COMMANDER v2.0: INSTITUTIONAL-GRADE MICROSTRUCTURE BOT
-ระบบบอทเทรด Binance Futures ที่ออกแบบตามหลัก **Market Microstructure** ระดับสถาบัน ผสาน Order Book Analysis, Whale Signal, Spoof Detection, Trade-based OBI, Regime Detection, Dynamic Kill Switch, Flip Logger และ Auto-Monitor ไว้ในไฟล์เดียว (`main_commander.py`)
+ระบบบอทเทรด Binance Futures ที่ออกแบบตามหลัก **Market Microstructure** ระดับสถาบัน ผสาน Order Book Analysis, Whale Signal, Spoof Detection, Trade-based OBI, Regime Detection, Dynamic Kill Switch, VolatilityGate, Dynamic Lot Sizing, Equity Kill Switch, Variance Age Exit, Flip Logger, Auto-Monitor และ Cloudflare Worker IP Bypass ไว้ในไฟล์เดียว (`main_commander.py`)
 
 **Philosophy: "รอดให้ได้ก่อน แล้วค่อยทำกำไร"**
 
@@ -15,17 +15,22 @@
 | **Order Book Engine** | Local Order Book Sync (Event-based), OBI, OFI, Spoof Detector (3-Gate) |
 | **Trade OBI Engine** | aggTrade WebSocket → OBI^T Rolling 30s Window (O(1)) |
 | **Regime Detector** | วิเคราะห์ CHOPPY/TRENDING/VOLATILE จาก price_buffer |
+| **VolatilityGate** | σ/μ Ratio (Volatility/Drift) ตรวจ Trending แบบ Real-time |
 | **Flip Logger** | บันทึกทุก OBI Flip + ตรวจ outcome 5 นาทีทีหลัง (Self-Learning) |
 | **Whale Signal** | Tiered Wall Classification (WATCH/STRONG/MEGA) |
 | **OBI Flip Alert** | Triple-Verified Early Warning (4 Gates) ตรวจจับ Liquidity Vacuum |
-| **Kill Switch** | Dynamic Cooldown ตาม Regime (CHOPPY 60s / TRENDING 120s / VOLATILE 240s) |
+| **Kill Switch** | Dynamic Cooldown ตาม Regime (CHOPPY 60s / TRENDING 300s / VOLATILE 240s) |
+| **Equity Kill Switch** | หยุด DCA + ยกเลิก Orders เมื่อ Drawdown > 30% |
+| **Dynamic Lot Sizing** | ลด Lot อัตโนมัติตาม Layer (100% → 30%) — Downward Protection |
+| **Variance Age Exit** | บังคับปิด Position เมื่อถือเกิน 72 ชั่วโมง |
 | **Auto-Monitor** | ตรวจพอร์ต 6 rules อัตโนมัติทุก 60 วินาที |
 | **Telegram Interface** | รับคำสั่ง + ส่ง Dashboard ผ่าน Outbound Token Bucket |
 | **SAE (Survivability)** | บริหาร API Weight ป้องกัน IP Ban |
+| **Cloudflare Worker Proxy** | มุด IP ผ่าน CF edge เมื่อ VPS ถูก Binance block (100k req/day ฟรี) |
 
 ---
 
-## 🧱 2. 9-Layer Institutional Architecture
+## 🧱 2. 12-Layer Institutional Architecture
 
 ระบบแบ่งเป็น 4 เสาหลักตามหลัก Quantitative Trading:
 
@@ -46,13 +51,16 @@
 | Layer | ชื่อ | หน้าที่ |
 |---|---|---|
 | L6 | **Regime Detector** | ระบุสภาวะตลาด CHOPPY/TRENDING/VOLATILE จาก price range |
-| L7 | **Flip Logger** | บันทึก OBI Flip events + outcome เพื่อ self-learning pattern |
+| L7 | **VolatilityGate** | σ/μ Ratio ตรวจ Trending แบบ Real-time + Re-arm 3 bars |
+| L8 | **Flip Logger** | บันทึก OBI Flip events + outcome เพื่อ self-learning pattern |
 
 ### เสา 4: Risk Management & Survival
 | Layer | ชื่อ | หน้าที่ |
 |---|---|---|
-| L8 | **OBI Flip Alert** | Early Warning (4 Gates) + Dynamic Kill Switch ตาม Regime |
-| L9 | **Auto-Monitor** | ตรวจพอร์ต 6 rules ป้องกัน Adverse Selection |
+| L9 | **OBI Flip Alert** | Early Warning (4 Gates) + Dynamic Kill Switch ตาม Regime |
+| L10 | **Equity Kill Switch** | Drawdown > 30% → หยุด DCA + Cancel All Orders |
+| L11 | **Dynamic Lot Sizing** | ลด Lot ตาม Layer — Downward Protection |
+| L12 | **Auto-Monitor** | ตรวจพอร์ต 6 rules + Variance Age Exit 72 ชั่วโมง |
 
 ---
 
@@ -62,7 +70,6 @@
 - **Grid Step** คำนวณจากความผันผวน 24 ชม. (0.5%–2.0%) และ Instantaneous Volatility จาก price_buffer
 - ถ้า price_buffer ยังไม่พอ (< 2 entries หลัง restart): ใช้ `vol_24h / 24` เป็น proxy inst_vol แทน
 - ตั้งแต่ไม้ที่ 4+ ระยะห่างขยาย ×1.25, ×1.50... (Deep DCA Guard)
-- SAFE mode: ถอยระยะไม้ห่างขึ้น 50% อัตโนมัติเมื่อพอร์ตวิกฤต
 - Auto-recover mode จาก Layer count เมื่อ restart (ไม่ reset เป็น NORMAL)
 
 **สูตรคำนวณ Grid Step:**
@@ -71,26 +78,90 @@ base_step   = max(0.5, min(2.0, vol_24h / 8))
 inst_vol    = (max(price_buffer) - min(price_buffer)) / min(price_buffer) × 100
 grid_step   = base_step + (inst_vol × 0.8)
 
-SAFE mode:  grid_step × 1.5
+SAFE mode (Layer < 10):   grid_step × 1.5   (+50%)
+SAFE mode (Layer ≥ 10):   grid_step × 3.0   (+200%) ← CRITICAL SAFE
 ```
 
-### 3.2 Trailing Stop (Full Close)
+### 3.2 Dynamic Grid Step Scaling ตาม Layer
+เมื่อบอทเข้า SAFE Mode ระยะ Grid จะถูกคูณตาม Layer เพื่อรอ Mean-reversion ที่ไกลกว่า:
+
+| Layer | Mode | Grid Multiplier | เหตุผล |
+|---|---|---|---|
+| 1–5 | NORMAL | ×1.0 (100%) | เทรดปกติ |
+| 6–7 | PRE-SAFE | ×1.25 (125%) | เริ่มระวัง |
+| 8–9 | SAFE | ×1.5 (150%) | ถอยระยะ 50% |
+| 10–12 | CRITICAL SAFE | ×3.0 (300%) | ป้องกัน Margin แตก |
+
+### 3.3 Trailing Stop (Full Close)
 - เปิด Trailing เมื่อราคาถึง Take Profit target
 - ปิด Position ทั้งหมดเมื่อราคาหลุด Peak × 0.9995
 - **OBI Boost**: ถ้า OBI < -0.6 → ปิดเร็วขึ้น (Peak × 0.9998)
 
-### 3.3 Strategy Modes
+### 3.4 Strategy Modes
 | Mode | เงื่อนไข | พฤติกรรม |
 |---|---|---|
 | **NORMAL** | Layer < 6, ไม่มีวิกฤต | เทรดปกติ Grid Step เต็ม |
-| **SAFE** | Layer ≥ 6 (auto) หรือสั่งมือ | ถอยระยะ 50%, ลด TP |
+| **SAFE** | Layer ≥ 6 (auto) หรือสั่งมือ | ถอยระยะ 50–200%, ลด TP |
 | **PROFIT** | กำไร ≥ $2, Layer < 6 | ลด TP 50% ปิดงานเร็ว |
 
 ---
 
-## 🐳 4. Whale Signal System (Order Book Analysis)
+## 📐 4. Dynamic Lot Sizing (Downward Protection)
 
-### 4.1 OBI — Order Book Imbalance (Limit Order-based, Flat Weight)
+ลดขนาด Lot อัตโนมัติเมื่อ Layer ลึกขึ้น เพื่อชะลอ Triangular Loss Growth:
+
+| Layer | Lot Scale | ผลลัพธ์ |
+|---|---|---|
+| 1–5 | **100%** | Lot ปกติ |
+| 6–7 | **75%** | ลด 25% |
+| 8–9 | **50%** | ลด 50% |
+| 10+ | **30%** | ลด 70% — รักษา Margin ก้อนสุดท้าย |
+
+**สูตร:**
+```
+base_lot  = max(200, min((wallet_balance × 0.8 / 5) × leverage, 500))
+lot_scale = _get_lot_scale()     # ตาม Layer ปัจจุบัน
+actual_lot = base_lot × lot_scale
+```
+
+**ทำไมไม่ใช้ Martingale:**
+- Martingale: Lot เพิ่มแบบ Exponential → พอร์ตแตกเร็วมาก
+- Downward Lot: Lot ลดแบบ Fractional → ยืดอายุพอร์ต + รอ Mean-reversion ได้นานกว่า
+
+---
+
+## 🌡️ 5. VolatilityGate (σ/μ Ratio Real-time)
+
+ตรวจจับ Regime แบบ Real-time ด้วยอัตราส่วน Volatility ต่อ Drift:
+
+### หลักการ
+```
+σ = std dev ของ log returns (ความผันผวน)
+μ = mean absolute MA change (ทิศทาง Drift)
+
+σ/μ Ratio สูง  → CHOPPY  (Volatility ครอบงำ)  → ปลอดภัยสำหรับ Grid
+σ/μ Ratio ต่ำ  → TRENDING (Drift ครอบงำ)     → อันตราย บล็อก DCA
+```
+
+### เกณฑ์
+| สภาวะ | σ/μ Ratio | Action |
+|---|---|---|
+| **CHOPPY (ปลอดภัย)** | ≥ 5.0 | Grid ทำงานปกติ |
+| **TRENDING (อันตราย)** | < 5.0 | บล็อก DCA ทันที |
+| **Ranging สมบูรณ์** | ≈ 999 (μ → 0) | CHOPPY สูงสุด |
+
+### Re-arming (ป้องกัน Pause/Resume Oscillation)
+บอทจะไม่ Re-arm ทันทีที่ σ/μ เด้งกลับ ต้องผ่านเงื่อนไข:
+```
+σ/μ ≥ 5.0 ติดต่อกัน 3 รอบ (VGATE_REARM_BARS = 3) → Re-arm
+```
+ป้องกันบอทเปิดๆ ปิดๆ จากสัญญาณ Whipsaw
+
+---
+
+## 🐳 6. Whale Signal System (Order Book Analysis)
+
+### 6.1 OBI — Order Book Imbalance (Limit Order-based, Flat Weight)
 ```
 OBI_flat = (Σ Bid_price × Bid_qty  -  Σ Ask_price × Ask_qty)
            ─────────────────────────────────────────────────
@@ -98,6 +169,7 @@ OBI_flat = (Σ Bid_price × Bid_qty  -  Σ Ask_price × Ask_qty)
 
 source: Top 20 levels, น้ำหนักเท่ากันทุก level
 ```
+
 ช่วงค่า -1.0 ถึง +1.0:
 
 | ค่า OBI | สัญญาณ | ความหมาย |
@@ -110,7 +182,7 @@ source: Top 20 levels, น้ำหนักเท่ากันทุก level
 
 **ข้อจำกัด**: OBI เป็น L2 Data (Aggregated) — Noise สูง, Decay ใน ~5 วินาที ต้องใช้ OFI และ Trade OBI ยืนยันก่อน confirmed
 
-### 4.2 OBI Deep — Distance-Weighted OBI (Top 5 Levels)
+### 6.2 OBI Deep — Distance-Weighted OBI (Top 5 Levels)
 วัด Order Book Imbalance แบบถ่วงน้ำหนักตามระยะห่างจาก mid-price — ใช้เฉพาะ **Top 5 levels**:
 
 ```
@@ -131,26 +203,13 @@ OBI_deep = (Σ w_i × Bid_qty  -  Σ w_i × Ask_qty)
 | L4 | $0.40 | 4 ticks | 0.200 |
 | L5 | $0.50 | 5 ticks | 0.167 |
 
-**ทำไมใช้ Top 5 + Tick Distance:**
-- Top 5 = จุดสมดุล depth/noise ที่ดีที่สุด (งานวิจัย HFT) — level 6–20 เพิ่ม noise ไม่เพิ่ม signal
-- Tick distance สะท้อน Execution Probability จริง (ใกล้ mid = โอกาสถูกจับคู่สูง)
-- % distance ใช้ไม่ได้: BTC spread แคบ ~0.01% ทำให้ทุก level ได้ weight ≈ 0.99 (ไม่ต่างกัน)
-
 **Spoof Detection จาก OBI_flat vs OBI_deep:**
 ```
 OBI_flat สูง + OBI_deep ต่ำ → กำแพงอยู่ไกล mid → สัญญาณ Layering/Spoofing
 gap = OBI_flat - OBI_deep > 0.25 → แสดง 🔍(Deep diverge — wall ไกล mid) ใน Dashboard
 ```
 
-**ใช้งานใน Decision Logic:**
-| Gate | เงื่อนไข | bypass |
-|---|---|---|
-| ไม้แรก | `OBI_flat ≥ -0.30` AND `OFI confirmed` AND `OBI_deep ≥ -0.35` | data ยังไม่พร้อม |
-| DCA | `OBI_flat ≥ -0.30` AND `OFI confirmed` AND `OBI_deep ≥ -0.35` | layer ≥ 10 หรือ data ไม่พร้อม |
-
-threshold Deep ผ่อนกว่า flat (-0.35 vs -0.30) เพราะ Top 5 อาจ noisy ช่วง spread กว้าง
-
-### 4.3 OFI — Order Flow Imbalance (Stabilizer)
+### 6.3 OFI — Order Flow Imbalance (Stabilizer)
 วัดการเปลี่ยนแปลง best bid/ask ทุก tick แบบ sign-based:
 ```
 bid ขึ้น หรือ qty เพิ่ม  →  +1  (buy flow)
@@ -162,7 +221,7 @@ ask ลด  หรือ qty ลด     →  +1  (buy flow)
 - OBI + OFI ชี้ทิศเดียวกัน = "confirmed" → บอทอนุญาตเปิดไม้
 - OBI สูง + OFI ติดลบ = "Trades Oppose Quotes" = สัญญาณ Spoofing ⚠️
 
-### 4.4 Trade OBI — OBI^T (Executed Trade-based)
+### 6.4 Trade OBI — OBI^T (Executed Trade-based)
 วัดแรงซื้อ/ขายจาก **Executed Trades จริง** ผ่าน aggTrade WebSocket (ทุก 100ms):
 ```
 source:  wss://fstream.binance.com/ws/btcusdt@aggTrade
@@ -182,21 +241,21 @@ OBI^T = (V_buy - V_sell) / (V_buy + V_sell)
 | Decay | ~5 วินาที | ~5 วินาที | Rolling 30 วินาที |
 | บทบาทหลัก | Entry/DCA gate | Secondary confirm + Spoof hint | Ultimate Gate (OBI Flip Gate 4) |
 
-### 4.5 3-Gate Spoof Detector
+### 6.5 3-Gate Spoof Detector
 | Gate | เงื่อนไข | หลักการ |
 |---|---|---|
 | **Gate 1** | Volume ≥ 6× avg | กำแพงจริงต้องหนักกว่าสภาพคล่องปกติ |
 | **Gate 2** | ห่างจาก mid-price ≤ 0.5% | ไกลกว่านี้ = Bait Wall ล่อรายย่อย |
 | **Gate 3** | อยู่นาน ≥ 3 วินาที | หายเร็ว = Spoof (Quote Life Span สั้น) |
 
-### 4.6 Tiered Wall Classification
+### 6.6 Tiered Wall Classification
 | Icon | Tier | Threshold | ความหมาย |
 |---|---|---|---|
 | 🟡 | WATCH | ≥ 6× avg | Retail Whale |
 | 🟠 | STRONG | ≥ 8× avg | Institutional |
 | 🔴 | MEGA | ≥ 15× avg | S-class / OTC level |
 
-### 4.7 OBI Flip Alert — Triple Verified (4 Gates)
+### 6.7 OBI Flip Alert — Triple Verified (4 Gates)
 ตรวจจับ Liquidity Vacuum ด้วย 4 ด่าน:
 
 | Gate | เงื่อนไข | หลักการ |
@@ -214,12 +273,6 @@ OBI ร่วงจาก +0.92 → -0.57
 🧭 Regime: CHOPPY → ชะลอระบบ 60s (แรงขายจริง ไม่ใช่ Spoof)
 ```
 
-**ตัวอย่าง Cooldown หมด:**
-```
-✅ Kill Switch: cooldown หมดแล้ว กลับมาเทรดปกติครับ
-🧭 Regime: CHOPPY | Cooldown: 60s
-```
-
 **Diagnostic Log (เมื่อ Gate 4 Block):**
 ```
 🟡 OBI FLIP BLOCKED by TradeOBI: +0.09 (Regime CHOPPY 0.02%) — Flickering Liquidity ignored
@@ -227,7 +280,7 @@ OBI ร่วงจาก +0.92 → -0.57
 
 ---
 
-## 🧭 5. Regime Detector (Active)
+## 🧭 7. Regime Detector
 
 ตรวจจับสภาวะตลาดจาก price_buffer — ใช้งานจริงในการปรับ Dynamic Cooldown ของ Kill Switch:
 
@@ -238,19 +291,16 @@ rng = (max(price_buffer) - min(price_buffer)) / min(price_buffer) × 100
 | Regime | เงื่อนไข | Icon | KS Cooldown | ความหมาย |
 |---|---|---|---|---|
 | **CHOPPY** | rng < 0.15% | ↔️ | 60s | Sideways ผันผวนน้อย Liquidity กลับเร็ว |
-| **TRENDING** | 0.15% ≤ rng ≤ 0.8% | 📈 | 120s | มีทิศทาง รอ Momentum หมดแรงก่อน |
+| **TRENDING** | 0.15% ≤ rng ≤ 0.8% | 📈 | 300s | มีทิศทาง รอ Momentum หมดแรงก่อน |
 | **VOLATILE** | rng > 0.8% | ⚡ | 240s | ผันผวนสูง Capital Preservation สูงสุด |
 | **WARMING** | buffer < 2 entries | 🌡️ | 60s | เพิ่งเริ่ม รอข้อมูล (~10s) |
 | **ERROR** | Exception | ⚠️ | 60s | ข้อผิดพลาดภายใน |
 
-แสดงใน Dashboard:
-```
-🧭 Regime: 📈 TRENDING (0.1511% range) | Trade OBI: +0.33
-```
+> **หมายเหตุ**: TRENDING Cooldown เพิ่มจาก 120s → **300s** เพื่อรอให้ Momentum หมดแรงจริงๆ ก่อน Re-arm
 
 ---
 
-## 📓 6. Flip Logger — Self-Learning Pattern Engine
+## 📓 8. Flip Logger — Self-Learning Pattern Engine
 
 บันทึกทุก OBI Flip event อัตโนมัติ และตรวจ outcome หลัง 5 นาที:
 
@@ -268,26 +318,26 @@ price, regime, cooldown
 | 🔴 DUMP | delta ≤ -0.1% | ราคาลงต่อ = ห้ามเทรดถูกต้อง |
 | ⚪ FLAT | -0.1% < delta < +0.1% | ราคาทรงตัว |
 
-**ตัวอย่าง Flip Stats (กด `📓 Flip Stats` ใน Telegram):**
+**Insight จาก Data จริง (n=25):**
 ```
-📓 Flip Log Stats (8 events)
-  CHOPPY  → 🟢 BOUNCE 75% | 🔴 DUMP 12% | ⚪ FLAT 12% (n=8)
-  TRENDING → 🟢 BOUNCE 50% | 🔴 DUMP 50% | ⚪ FLAT 0% (n=2)
-─ ล่าสุด 3 events ─
-  21:01 [CHOPPY] BOUNCE +0.182% | OBI +1.00→-0.96 T:-0.25
-  20:56 [TRENDING] DUMP -0.073% | OBI +0.69→-0.38 T:-0.30
-  20:50 [CHOPPY] BOUNCE +0.123% | OBI +0.88→-0.93 T:-0.32
+CHOPPY  → BOUNCE 8% | DUMP 0% | FLAT 92%   ← OBI Flip ใน CHOPPY = Noise ล้วนๆ
+TRENDING → BOUNCE 0% | DUMP 100% | FLAT 0%  ← สัญญาณจริง (แต่ sample น้อย)
 ```
 
-**วิธีใช้ประโยชน์:**
-- สะสม 20–30 events → รู้ Win Rate จริงแยกตาม Regime
-- BOUNCE สูงใน CHOPPY → Cooldown 60s อาจสั้นเกินไป (ยังมีโอกาสซื้อ)
-- DUMP สูงใน VOLATILE → Cooldown 240s คุ้มค่า ไม่ต้องลด
-- ปรับ threshold และ cooldown ในอนาคตด้วยหลักฐานจากตลาดจริง (Data-Driven)
+**ตัวอย่าง Flip Stats (กด `📓 Flip Stats` ใน Telegram):**
+```
+📓 Flip Log Stats (25 events)
+  CHOPPY  → 🟢 BOUNCE 8% | 🔴 DUMP 0% | ⚪ FLAT 92% (n=24)
+  TRENDING → 🟢 BOUNCE 0% | 🔴 DUMP 100% | ⚪ FLAT 0% (n=1)
+─ ล่าสุด 3 events ─
+  03:26 CHOPPY FLAT -0.002% | OBI +0.98→-0.59 T:-0.34
+  03:34 CHOPPY FLAT +0.043% | OBI +0.97→-0.73 T:-0.85
+  04:09 CHOPPY FLAT +0.008% | OBI +0.72→-0.83 T:-0.39
+```
 
 ---
 
-## 🤖 7. Auto-Monitor (6 Rules)
+## 🤖 9. Auto-Monitor (6 Rules)
 
 ตรวจพอร์ตอัตโนมัติทุก 60 วินาที:
 
@@ -296,31 +346,61 @@ price, regime, cooldown
 | 1 | กำไร ≥ $5 | ปิด Position อัตโนมัติทันที |
 | 2 | กำไร ≥ $2 + Layer < 6 | เปลี่ยนเป็น PROFIT mode |
 | 3 | ขาดทุน ≤ -$120 | แจ้งเตือน Telegram ฉุกเฉิน |
-| 4 | Layer ≥ 8 | บังคับ SAFE mode |
-| 5 | Layer ≥ 10 | บังคับ SAFE + ถอยระยะ 50% |
-| 6 | ราคาใกล้ Liquidation ≤ 5% | แจ้งเตือน Liq proximity ฉุกเฉิน |
+| 4 | Layer ≥ 6 | บังคับ SAFE mode |
+| 5 | Layer ≥ 8 (CRITICAL) | บังคับ SAFE + Grid ×3.0 (CRITICAL SAFE) |
+| 6 | Position ถือ ≥ 72 ชั่วโมง | บังคับปิด (Variance Age Exit) |
 
 ---
 
-## 🛡️ 8. ระบบความปลอดภัย (Safety Systems)
+## 🛡️ 10. ระบบความปลอดภัย (Safety Systems)
 
-### 8.1 Dynamic Kill Switch (Regime-Aware)
+### 10.1 Dynamic Kill Switch (Regime-Aware)
 **Trigger 1 — Volatility Spike:**
 - inst_vol > 1.0% สะสม ≥ 2 ครั้งติดต่อกัน → Kill Switch ON
 - Cooldown: Dynamic ตาม Regime
 
 **Trigger 2 — OBI Flip (4 Gates):**
 - ผ่านครบ 4 Gates → Kill Switch ON พร้อมแจ้ง Telegram
+- **CHOPPY: Bypass** (92% FLAT empirical data — Mechanical Noise)
+- **TRENDING/VOLATILE: Active** (Informational Signal)
 
 **Dynamic Cooldown (ปรับอัตโนมัติตาม Regime จริง ณ ขณะนั้น):**
 | Regime | Icon | Cooldown | เหตุผล |
 |---|---|---|---|
 | **CHOPPY** | ↔️ | 60s | Liquidity กลับเร็ว ไม่เสียโอกาส |
-| **TRENDING** | 📈 | 120s | รอ Momentum หมดแรงก่อน DCA |
+| **TRENDING** | 📈 | **300s** | รอ Momentum หมดแรงก่อน (เพิ่มจาก 120s) |
 | **VOLATILE** | ⚡ | 240s | Capital Preservation สูงสุด |
 | **WARMING / ERROR** | 🌡️⚠️ | 60s | ค่าปลอดภัย รอข้อมูลครบ |
 
-### 8.2 Outbound Token Bucket (Telegram Rate Limiter)
+### 10.2 Equity Kill Switch (Drawdown-based)
+หยุด DCA และยกเลิก Open Orders ทั้งหมดเมื่อพอร์ตวิกฤต:
+
+```
+Drawdown = PNL / (Available Balance + |PNL|)
+Drawdown ≤ -30% → Equity Kill Active
+  1. ยกเลิก Open Orders ทั้งหมด (คืน Margin)
+  2. บล็อก DCA ทุก Layer
+  3. แจ้งเตือน Telegram
+  4. รอ User Reset ด้วยคำสั่ง 🔄 NORMAL หรือ ▶️ รันต่อ
+```
+
+**Emergency Balance Lock (เพิ่มเติม):**
+```
+Available Balance < $30 → บล็อก DCA ทันที (รักษา Margin ไว้)
+แจ้งเตือนทุก 5 นาที (ไม่ spam)
+```
+
+### 10.3 VolatilityGate (σ/μ Filter)
+บล็อก DCA เมื่อ σ/μ < 5.0 (Trending detected) — ดูหัวข้อ 5 สำหรับรายละเอียด
+
+### 10.4 Variance Age Exit (Time-based Stop)
+```
+Position ถือเกิน 72 ชั่วโมง → บังคับปิดอัตโนมัติ
+เหตุผล: Variance ของพอร์ต Grid เติบโตแบบ Exponential ตามเวลา
+         ยิ่งถือนาน → โอกาสเจอเหตุการณ์ล้างพอร์ตสูงขึ้น
+```
+
+### 10.5 Outbound Token Bucket (Telegram Rate Limiter)
 ป้องกัน Telegram API Error 429:
 ```
 Capacity:    3 tokens  (burst สูงสุด 3 ข้อความ)
@@ -328,7 +408,7 @@ Refill Rate: 1 token/วินาที
 Queue:       สูงสุด 10 ข้อความ
 ```
 
-### 8.3 Local Order Book — Event-based Sync
+### 10.6 Local Order Book — Event-based Sync
 แก้ปัญหา Windows latency (~17,578 update IDs/sec gap):
 ```
 1. รับ WebSocket depth event ตรงๆ ไม่ต้อง REST snapshot
@@ -337,7 +417,7 @@ Queue:       สูงสุด 10 ข้อความ
 4. gap ใหญ่ (≥ 50k) → reset และ sync ใหม่
 ```
 
-### 8.4 SAE (Survivability-Aware Execution)
+### 10.7 SAE (Survivability-Aware Execution)
 | Weight Usage | Action |
 |---|---|
 | > 60% | throttle low-priority (delay 2s) |
@@ -345,17 +425,36 @@ Queue:       สูงสุด 10 ข้อความ
 | > 95% | block ทุกคำสั่งยกเว้น trade |
 | 429/418 | Backoff อัตโนมัติ ไม่ crash |
 
-### 8.5 Anti-Falling Knife
+### 10.8 Anti-Falling Knife
 - ไม่เปิดไม้แรกเมื่อราคา > 85% ของกรอบ 24 ชม.
 - ไม่เปิดไม้แรกเมื่อ Instant Volatility > 0.4%
+- ไม่เปิดไม้แรกเมื่อ VolatilityGate = BLOCKED
 
-### 8.6 Session Recovery
+### 10.9 Max Daily Loss (Prop Firm Style)
+หยุดเทรดทั้งวันเมื่อขาดทุนสะสม (Realized) เกินเกณฑ์:
+```
+MAX_DAILY_LOSS = -$50/วัน
+Realized PnL สะสม ≤ -$50 → _daily_kill_active = True
+  - บล็อกทั้งไม้แรกและ DCA ตลอดวัน
+  - Reset อัตโนมัติเมื่อขึ้นวันใหม่ (UTC 00:00)
+  - แจ้งเตือน Telegram ทันทีที่ trigger
+```
+
+### 10.10 Rapid-Fire Order Throttle
+ป้องกันบอทส่ง order รัวผิดปกติ (Algorithm Malfunction / Runaway Bot):
+```
+สูงสุด 3 orders ใน 60 วินาที (sliding window)
+เกินเกณฑ์ → บล็อก + แจ้งเตือน Telegram ทันที
+หลุดจาก window อัตโนมัติ → ทำงานต่อได้เอง
+```
+
+### 10.11 Session Recovery
 - Restart → ตรวจ Layer count จาก Position จริง
 - Layer ≥ 6 → auto-set SAFE mode ทันที (ไม่ reset)
 
 ---
 
-## 📟 9. Telegram Menu
+## 📟 11. Telegram Menu
 
 ```
 ┌─────────────────────────────────┐
@@ -370,89 +469,90 @@ Queue:       สูงสุด 10 ข้อความ
 |---|---|---|
 | `📊 พอร์ต` | ข้อมูล | Dashboard ครบ + Regime + Trade OBI + Whale Signal |
 | `💰 กำไรวันนี้` | ข้อมูล | Income History |
-| `📓 Flip Stats` | ข้อมูล | สถิติ OBI Flip Win Rate แยก Regime (L7) |
-| `🛡️ SAFE` | Mode | ถอยระยะ +50%, ลด TP |
+| `📓 Flip Stats` | ข้อมูล | สถิติ OBI Flip Win Rate แยก Regime (L8) |
+| `🛡️ SAFE` | Mode | ถอยระยะ +50–200%, ลด TP |
 | `💸 PROFIT` | Mode | ลด TP 50% ปิดงานเร็ว |
-| `🔄 NORMAL` | Mode | บอทตัดสินใจตามตลาดเอง |
+| `🔄 NORMAL` | Mode | บอทตัดสินใจตามตลาดเอง + **Reset Equity Kill Switch** |
 | `⏸️ หยุด` | ควบคุม | Pause bot (ไม่เปิดไม้ใหม่) |
-| `▶️ รันต่อ` | ควบคุม | Resume bot |
+| `▶️ รันต่อ` | ควบคุม | Resume bot + **Reset Equity Kill Switch** |
 | `💥 ปิด Position` | ควบคุม | Full Close ทันที |
 | `🔄 Restart` | ระบบ | pm2 restart bot |
 | `🛑 Stop Bot` | ระบบ | pm2 stop bot |
 
 ---
 
-## 📊 10. Dashboard ตัวอย่าง
+## 📊 12. Dashboard ตัวอย่าง
 
 ```
 🏰 COMMANDER DASHBOARD v2.0
 ━━━━━━━━━━━━━━━━━━
 📡 Status: 🟢 ONLINE | Mode: 🛡️ SAFE
-💰 Balance: $384.76 ($55.78 avail)
-⚙️ Grid Step: 0.931% | TP: +3.60% (Net)
+💰 Balance: $384.95 ($55.78 avail)
+⚙️ Grid Step: 0.750% | TP: +3.19% (Net)
 ━━━━━━━━━━━━━━━━━━
 🚀 POSITION: 📈 LONG | 0.072 BTC
-├ ❄️ PNL: $-121.28 (-36.88%)
+├ ❄️ PNL: $-158.66 (-48.25%)
 ├ Entry: $68,510.54
-├ Mark:  $66,844.40
+├ Mark:  $66,327.70
 └ Net BE: $68,558.52
 ━━━━━━━━━━━━━━━━━━
 🔮 ACTION PLAN: (DCA Strategy)
 ├ Layer: 10/12
-├ Buy Next: $64,734.3
-└ Predicted Avg: $68,144.7
+├ Buy Next: $65,334.5
+└ Predicted Avg: $68,205.4
 ━━━━━━━━━━━━━━━━━━
-🧭 Regime: 📈 TRENDING (0.1511% range) | Trade OBI: +0.33
+🧭 Regime: ↔️ CHOPPY (0.0000% range) | Trade OBI: -0.45
 ━━━━━━━━━━━━━━━━━━
-🐳 Whale Signal: 🐳 STRONG SELL | OBI -0.81 OFI -0.03 | $0.1M vs $1.4M
-🕵️ Spoof 3 walls (ระวัง!)
+🐳 Whale Signal: กำลังเชื่อมต่อ Order Book...
 ```
 
 ---
 
-## 🚀 11. การเริ่มต้นใช้งาน
+## 🚀 13. การเริ่มต้นใช้งาน
 
-### 11.0 Infrastructure (Production)
-บอทรันบน **Google Cloud Always Free VM** (ไม่มีค่าใช้จ่าย):
+### 13.0 Infrastructure
+บอทรันบน **Windows (Local)** หรือ **Google Cloud Always Free VM**:
 
 | Field | Value |
 |---|---|
 | ชื่อเครื่อง | commander-v2-bot |
 | Region | us-west1-a (Oregon) |
 | Spec | e2-micro (2 vCPU / 1 GB RAM) |
-| OS | Ubuntu 22.04 LTS |
-| Disk | 30 GB |
+| OS | Ubuntu 22.04 LTS / Windows 11 |
 | External IP | 8.229.111.0 |
 
+### 13.1 ติดตั้ง
 ```bash
-# SSH เข้าเครื่อง
-ssh <user>@8.229.111.0
+pip install -r requirements.txt
 ```
 
-### 11.1 ติดตั้ง
-```bash
-pip install -r configs/requirements.txt
-```
-
-### 11.2 ตั้งค่า `.env`
+### 13.2 ตั้งค่า `.env`
 ```env
 GL_API_KEY=your_binance_api_key
 GL_API_SECRET=your_binance_api_secret
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 BINANCE_PROXY=http://user:pass@host:port   # optional
+
+# Cloudflare Worker Proxy (เปิดใช้เมื่อ VPS IP ถูก Binance block)
+# ถ้าไม่ต้องการใช้ให้ comment บรรทัด CF_WORKER_URL ออก
+CF_WORKER_URL=https://binance-proxy.regency2919.workers.dev/proxy
+CF_PROXY_SECRET=commander_proxy_secret_2026
 ```
 
-### 11.3 รันบอท
+### 13.3 รันบอท
 ```bash
-# รันผ่าน pm2 (แนะนำ)
+# Windows (Local)
+python main_commander.py
+
+# Linux VPS ผ่าน pm2 (แนะนำ)
 pm2 start main_commander.py --interpreter python --name bot
 pm2 save
 pm2 logs bot
 pm2 restart bot
 ```
 
-### 11.4 ซิงค์โค้ดใหม่ขึ้น VPS (ทุกครั้งที่ push)
+### 13.4 ซิงค์โค้ดใหม่ขึ้น VPS
 ```bash
 cd binance-bot
 git pull
@@ -461,7 +561,7 @@ pm2 restart bot
 
 ---
 
-## 🔬 12. หลักการ Microstructure ที่บอทใช้
+## 🔬 14. หลักการ Microstructure ที่บอทใช้
 
 | แนวคิด | การนำมาใช้ในบอท |
 |---|---|
@@ -476,14 +576,23 @@ pm2 restart bot
 | **Executed Flow** | OBI^T: executed trades ไม่ถูก Spoof |
 | **Flickering Liquidity** | Choppy market OBI พลิกไว → Gate 4 กรองออก |
 | **Circuit Breaker** | Dynamic Cooldown = Cooling-off Period ระดับสถาบัน ปรับตาม Regime |
-| **Self-Learning** | Flip Logger (L7) สะสม Win Rate แยก Regime → ปรับ threshold อนาคต |
-| **Execution Probability** | OBI_deep: tick-distance weight สะท้อนโอกาสถูกจับคู่จริง — ใกล้ mid = หนักกว่า |
-| **Deep Order Flow** | OBI_flat vs OBI_deep diverge > 0.25 → Layering/Spoofing signature ไกล mid |
-| **Regime-Aware OBI Flip** | CHOPPY: Bypass Kill Switch (Mechanical/Noise) → TRENDING/VOLATILE: Kill Switch ON (Informational) |
+| **Self-Learning** | Flip Logger (L8) สะสม Win Rate แยก Regime → ปรับ threshold อนาคต |
+| **Execution Probability** | OBI_deep: tick-distance weight สะท้อนโอกาสถูกจับคู่จริง |
+| **Deep Order Flow** | OBI_flat vs OBI_deep diverge > 0.25 → Layering/Spoofing ไกล mid |
+| **Regime-Aware OBI Flip** | CHOPPY: Bypass Kill Switch (92% FLAT) → TRENDING: Active |
+| **Triangular Loss Growth** | Dynamic Lot Sizing ลด 30% ที่ Layer 10+ ชะลอ Drawdown |
+| **Volatility/Drift Ratio** | σ/μ Gate ตรวจ Trending Real-time ป้องกัน Falling Knife |
+| **Variance Age Risk** | Position ถือนานขึ้น → Variance เพิ่ม Exponential → Age Exit 72h |
+| **Max Daily Loss** | Prop Firm-style: ขาดทุนสะสม > $50/วัน → หยุดทั้งวัน (Realized PnL) |
+| **Runaway Bot Prevention** | Rapid-Fire Throttle: > 3 orders/60s → บล็อกทันที (Algorithm Malfunction guard) |
+| **Exchange Circuit Breaker** | ระดับตลาด: S&P 7%/13%/20% halt, SET 8%/15%/20% halt, LULD รายหุ้น |
+| **Cancel-on-Disconnect** | ถ้า Bot disconnect: Cancel All Orders อัตโนมัติป้องกัน orphan orders |
+| **ADL (Auto-Deleveraging)** | Binance last resort: ปิด Position ฝั่งกำไรหักล้าง Position ล้มละลาย |
+| **IP Geoblocking Bypass** | CF Worker edge proxy — VPS IP ถูก block ใช้ CF edge IP แทน (100k/day ฟรี) |
 
 ---
 
-## 🧠 14. Why OBI Flip ≠ Kill Switch ใน CHOPPY Market
+## 🧠 15. Why OBI Flip ≠ Kill Switch ใน CHOPPY Market
 
 ### Mechanical vs Informational Signal
 
@@ -492,7 +601,7 @@ pm2 restart bot
 | ผู้ขับเคลื่อน | HFT / Market Maker (Mechanical) | Informed Trader / Institution (Informational) |
 | สาเหตุ OBI Flip | Flickering Quotes, Bait Walls, Risk Management | Liquidity Vacuum, Liquidation Cascade, Breakout |
 | ผลต่อราคา | ไม่มีนัยสำคัญ — กลับสมดุลเอง | Permanent Price Impact — เทรนด์วิ่งต่อ |
-| Empirical Data (n=18) | **88.9% FLAT** (±0.1% ใน 5 นาที) | 100% DUMP ที่ตรวจพบ |
+| Empirical Data (n=25) | **92% FLAT** (±0.1% ใน 5 นาที) | **100% DUMP** ที่ตรวจพบ |
 | Kill Switch | **Bypass** — Grid เดินต่อ | **Active** — หยุดซื้อ |
 
 ### ทำไม Volatility Spike Kill Switch ยังทำงานทุก Regime
@@ -504,69 +613,308 @@ CHOPPY → TRENDING = inst_vol พุ่งสูง ≥ 2 ครั้งติ
 ระบบจึงแยก trigger ออกจากกัน:
 - **OBI Flip Kill Switch** → Regime-Aware (bypass ใน CHOPPY)
 - **Volatility Spike Kill Switch** → ทุก Regime ไม่มีข้อยกเว้น
+- **VolatilityGate** → σ/μ Real-time (Layer ใหม่ที่เพิ่มเข้ามา)
 
 ### เกราะป้องกันที่ยังคงอยู่ใน CHOPPY
 
 แม้ OBI Flip จะ bypass แต่บอทยังมีระบบป้องกันชั้นอื่น:
 1. **OFI Anchor** — entry gate ต้องผ่าน OFI confirmed ก่อนเปิดไม้
 2. **Volatility Spike KS** — ตรวจ inst_vol ทุก loop
-3. **Auto-Monitor** — Layer ≥ 6 → SAFE mode อัตโนมัติ
-4. **Anti-Falling Knife** — ไม่เปิดไม้แรกถ้า inst_vol > 0.4%
+3. **VolatilityGate** — σ/μ < 5.0 → บล็อก DCA ทันที
+4. **Auto-Monitor** — Layer ≥ 6 → SAFE mode อัตโนมัติ
+5. **Anti-Falling Knife** — ไม่เปิดไม้แรกถ้า inst_vol > 0.4%
+6. **Equity Kill Switch** — Drawdown > 30% → หยุด + ยกเลิก Orders
 
 ---
 
-## 📝 13. Changelog
+## 📝 16. Changelog
 
-### v2.0 (2026-03-29) — Current (Production on GCP Always Free)
+### v2.2 (2026-03-29) — Cloudflare Worker Proxy (IP Bypass)
+
+**Cloudflare Worker Proxy**
+- `cloudflare-proxy/worker.js` — Worker ที่ forward request จาก VPS → CF edge → Binance Futures API
+- `cloudflare-proxy/wrangler.toml` — config deploy, `placement.mode = "smart"` (edge ใกล้ที่สุด)
+- Auth: `X-Proxy-Secret` header ตรวจสอบก่อน forward (ป้องกัน abuse)
+- Route: `GET /health` → status; `ANY /proxy/*` → forward ไป `https://fapi.binance.com/*`
+- Deployed: `https://binance-proxy.regency2919.workers.dev/proxy`
+- Free tier: 100,000 requests/day
+- เปิดใช้: ตั้ง `CF_WORKER_URL` ใน `.env` / ปิดใช้: comment บรรทัดออก
+- `binance_global/async_client.py`: รับ `cf_worker_url` + `cf_proxy_secret` ใน `__init__()`, เปลี่ยน URL เมื่อ `_use_cf_proxy=True`
+- `shared/config.py`: เพิ่ม `CF_WORKER_URL` และ `CF_PROXY_SECRET` จาก env
+
+---
+
+### v2.1 (2026-03-29) — Crisis Management & Institutional Risk Controls
+
+**Dynamic Lot Sizing (Downward Protection)**
+- `_get_lot_scale()` — คืน multiplier ตาม Layer (1.0 → 0.75 → 0.50 → 0.30)
+- `LOT_SCALE_BY_LAYER` dict — Layer 0:100%, 6:75%, 8:50%, 10:30%
+- `lot_u = base_lot × _get_lot_scale()` ในทุก trading loop
+- ป้องกัน Triangular Loss Growth เมื่อ DCA ลึก
+
+**VolatilityGate (σ/μ Real-time)**
+- `_check_volatility_gate()` — คำนวณ σ/μ จาก price_history 20 entries
+- σ = std dev of log returns | μ = mean absolute MA change
+- σ/μ < 5.0 → `_vgate_blocked = True` → บล็อก DCA ทันที
+- Re-arm ต้องผ่าน σ/μ ≥ 5.0 ติดต่อกัน 3 รอบ (ป้องกัน Oscillation)
+- ใช้กรองทั้งไม้แรก (p_amt == 0) และ DCA (p_amt > 0)
+
+**Equity Kill Switch + Cancel All Orders**
+- `EQUITY_DRAWDOWN_LIMIT = -0.30` — Drawdown > 30% → Active
+- `EMERGENCY_BAL_LIMIT = 30.0` — Available < $30 → Block DCA
+- เมื่อ Active: เรียก `client.cancel_all_open_orders()` คืน Margin ทันที
+- Reset ได้ด้วย `🔄 NORMAL` หรือ `▶️ รันต่อ` ใน Telegram
+- เพิ่ม `cancel_all_open_orders()` ใน `binance_global/async_client.py`
+
+**CRITICAL SAFE Mode (Layer 10+)**
+- Grid Step Multiplier เพิ่มจาก **1.5x → 3.0x** เมื่อ Layer ≥ 10
+- รอ Mean-reversion ที่ไกลกว่ามาก ป้องกัน DCA รัวในเทรนด์
+
+**Variance Age Exit (72 ชั่วโมง)**
+- `AGE_EXIT_HOURS = 72` — บังคับปิด Position เมื่อถือเกิน
+- `_position_open_time` — track เวลาเปิด Position
+- Reset อัตโนมัติเมื่อ Position ปิด (p_amt == 0)
+- แจ้งเตือน Telegram พร้อม PNL ก่อนปิด
+
+**TRENDING Cooldown เพิ่มขึ้น**
+- `KS_COOLDOWN_TRENDING`: 120s → **300s (5 นาที)**
+- ป้องกันบอทรับมีดซ้ำขณะ Momentum ยังไม่หมด
+
+**Max Daily Loss Tracker**
+- `MAX_DAILY_LOSS = -50.0` — หยุดเทรดทั้งวันเมื่อขาดทุนสะสม > $50
+- `_record_realized_pnl()` — บันทึก Realized PnL หลังปิด Position ทุกครั้ง
+- `_reset_daily_loss_if_new_day()` — reset counter อัตโนมัติเมื่อขึ้นวันใหม่ (UTC)
+- `_daily_kill_active` — block ทั้งไม้แรกและ DCA ตลอดวัน
+
+**Rapid-Fire Order Throttle**
+- `THROTTLE_MAX_ORDERS = 3` — สูงสุด 3 orders ใน 60 วินาที
+- `_check_order_throttle()` — sliding window timestamp check
+- บล็อก + แจ้งเตือน Telegram เมื่อ trigger
+- ป้องกันบอทส่ง order รัวผิดปกติ (algorithm malfunction)
+
+---
+
+### v2.0 (2026-03-27) — Institutional-Grade Foundation
 
 **Priority 1: Trade-based OBI (OBI^T)**
 - `stream_aggtrade()` ใน `async_client.py` — WebSocket `btcusdt@aggTrade` ทุก 100ms
 - `aggtrade_callback()` + `_update_trade_obi()` — O(1) Rolling Window 30s ด้วย `deque`
 - OBI Flip Gate 4: Trade OBI < -0.15 เป็น Ultimate Confirmation
-- Diagnostic log เมื่อ Gate 4 block ("Flickering Liquidity ignored")
 
 **Priority 2: Active Regime-Aware Kill Switch**
 - `_get_regime()` — CHOPPY/TRENDING/VOLATILE/WARMING/ERROR
 - `_get_dynamic_cooldown()` — ปรับ KS_COOLDOWN อัตโนมัติตาม Regime
-- OBI Flip Alert แสดง Regime + cooldown จริงในข้อความ
-- Kill Switch release แสดง Regime + Cooldown ที่ใช้
+- CHOPPY Bypass: OBI Flip ใน CHOPPY = Mechanical Noise (92% FLAT empirical)
 
 **Priority 3: Outbound Token Bucket**
 - capacity=3, refill=1/sec, queue max=10
-- `_consume_out_token()` → `send_message()` → `_send_raw()` pipeline
-- Retry อัตโนมัติเมื่อ 429
 
 **Priority 4: Flip Logger (Self-Learning)**
-- `_flip_log` deque maxlen=100 — บันทึกทุก Flip event
-- `_flip_pending_outcome` — schedule outcome check ใน 5 นาที
-- `_process_flip_outcomes()` — เรียกทุก loop ตรวจ outcome อัตโนมัติ
-- `_get_flip_stats()` — สรุป Win Rate แยก Regime
+- `_flip_log` deque maxlen=100
+- `_process_flip_outcomes()` — schedule outcome check 5 นาที
 - ปุ่ม `📓 Flip Stats` ใน Telegram menu
 
-**Telegram Menu Redesign**
-- จัดกลุ่ม 4 แถวตาม function: ข้อมูล / Mode / ควบคุม / ระบบ
-- ชื่อปุ่มสั้นลง กดง่ายขึ้น backward compatible กับคำสั่งเก่า
+**Priority 5: OBI Deep (Distance-Weighted, Top 5)**
+- `_obi_deep` — tick distance weighting Top 5 levels
+- Gate เพิ่มใน `obi_ok` และ `obi_dca_ok`
 
 **LOB Event-based Sync**
 - ลบ REST snapshot dependency (แก้ Windows latency)
-- Accumulate 10 WebSocket events → `_lob_ready = True`
 - Gap validation: < 50k ข้ามไป, ≥ 50k reset
-
-**Bug Fixes**
-- Regime UNKNOWN หลัง restart → threshold `< 8` → `< 2`, label `WARMING`
-- Grid Step กระโดดลง 0.500% → fallback `inst_vol = vol_24h / 24`
-- Regime format `0.000%` → `0.0000%` (4 ตำแหน่ง)
-
-**Priority 5: OBI Deep (Distance-Weighted, Top 5)**
-- `_obi_deep` — คำนวณทุก depth event ควบคู่ `_obi_score` (ไม่ replace)
-- สูตร: `w_i = qty / (1 + |p - mid| / 0.10)` — tick distance weighting
-- Top 5 levels เท่านั้น: จุดสมดุล depth/noise (ตัด level 6–20 ที่เป็น Spoof zone)
-- Gate เพิ่มใน `obi_ok` (ไม้แรก) และ `obi_dca_ok` (DCA): `OBI_deep ≥ -0.35`
-- DCA bypass ยังคงอยู่เมื่อ layer ≥ 10 (survival mode ไม่ให้ signal ใหม่ขัด)
-- Dashboard แสดง `OBI_flat` + `OBI_deep` คู่กัน + Spoof hint เมื่อ gap > 0.25
 
 ---
 
-*COMMANDER v2.0 — Institutional-grade Microstructure Edition*
-*Stack: Python 3.10+ · asyncio · aiohttp · Binance Futures API (REST + WebSocket L2 + aggTrade) · pm2 · Ubuntu 22.04 LTS · Google Cloud e2-micro*
-*Concepts: OBI · OBI_deep · OFI · Trade OBI (OBI^T) · 3-Gate Spoof · Tiered Wall · 4-Gate OBI Flip · Dynamic Kill Switch · Regime Detector · Flip Logger · Auto-Monitor · Token Bucket*
+---
+
+## ⚡ 17. Kill Switch Theory — ระบบ 2 ระดับ
+
+### 17.1 ระดับบอทเทรด (Algorithmic Kill Switch)
+
+Kill Switch คือ "Circuit Breaker สำหรับ Algorithm" — ตัดการทำงานทันทีเมื่อความเสี่ยงทะลุเพดาน
+
+**Triggers ที่ COMMANDER v2.1 ใช้:**
+
+| Trigger | เงื่อนไข | Cooldown / Action |
+|---|---|---|
+| **Volatility Spike** | inst_vol > 1% ติด 2 รอบ | Dynamic Cooldown ตาม Regime |
+| **OBI Flip (4 Gates)** | Triple-Verified Flip | 60–300s + Cancel Orders |
+| **CUSUM Breakout** | Trend Detection (CPD) | Dynamic Cooldown + Cancel Orders |
+| **Equity Kill Switch** | Drawdown > 30% | Block DCA + Cancel All Orders |
+| **Emergency Balance** | Available < $30 | Block DCA (ป้องกัน Margin แตก) |
+| **VolatilityGate** | σ/μ < 5.0 | Block DCA จนกว่า Re-arm 3 bars |
+| **Max Daily Loss** | Realized Loss > $50/วัน | Block ทั้งวันจนเที่ยงคืน UTC |
+| **Rapid-Fire Throttle** | > 3 orders / 60s | Block ชั่วคราว แจ้งเตือน |
+| **Variance Age Exit** | Position > 72 ชั่วโมง | บังคับปิด Position |
+
+**Dynamic Adaptation (Regime-Aware):**
+```
+Kill Switch ไม่ได้ตอบสนองเหมือนกันทุกสถานการณ์
+CHOPPY   → OBI Flip Bypassed (Noise) + Cooldown สั้น 60s
+TRENDING → Kill Switch Active + Cooldown 300s (Full Recovery)
+VOLATILE → Capital Preservation Priority + Cooldown 240s
+```
+
+**ลำดับความสำคัญการบล็อก DCA:**
+```
+1. Daily Kill (สูงสุด — ขาดทุนสะสมทั้งวัน)
+2. Rapid-Fire Throttle (ป้องกัน Runaway Algorithm)
+3. Equity Kill Switch (Drawdown > 30%)
+4. VolatilityGate (σ/μ ต่ำ = Trending)
+5. Emergency Balance (< $30)
+6. Kill Switch (Volatility/OBI Flip/CUSUM)
+```
+
+---
+
+### 17.2 ระดับตลาดหลักทรัพย์ (Exchange Circuit Breakers)
+
+**Market-Wide Circuit Breakers:**
+
+| ตลาด | Level 1 | Level 2 | Level 3 |
+|---|---|---|---|
+| **S&P 500 (สหรัฐ)** | ลง 7% → หยุด 15 นาที | ลง 13% → หยุด 15 นาที | ลง 20% → หยุดทั้งวัน |
+| **SET (ไทย)** | ลง 8% → หยุด 30 นาที | ลง 15% → หยุด 30 นาที | ลง 20% → หยุด 60 นาที |
+| **Binance Futures** | ไม่มี Market-Wide halt | LULD รายคู่ | Insurance Fund → ADL |
+
+**Limit Up – Limit Down (LULD) รายหุ้น:**
+- หุ้นผันผวนเกินกรอบ (5%/10%/20%) ใน 5 นาที → หยุด 5–10 นาที
+- บังคับให้ราคา settle ภายใน band ก่อนเปิดใหม่
+
+**Cancel-on-Disconnect (COD):**
+```
+บอทหลุดการเชื่อมต่อ → ตลาดยกเลิก Open Orders ทั้งหมดอัตโนมัติ
+ป้องกัน Orphan Orders ที่เจ้าของควบคุมไม่ได้
+COMMANDER v2.1 มี _cancel_all_open_orders() ทำงานคู่กัน
+```
+
+**Auto-Deleveraging (ADL) — Binance Last Resort:**
+```
+เมื่อ Insurance Fund ไม่พอรับมือ Bankruptcy Position
+→ ระบบยึด Position ฝั่งกำไรมาหักล้างโดยอัตโนมัติ
+→ ผู้ที่ถูก ADL จะถูกปิด Position ที่ Mark Price โดยไม่มีการเตือน
+ADL Risk: ยิ่ง Leverage สูงและ PnL% สูง ยิ่งเสี่ยง ADL
+```
+
+---
+
+### 17.3 ความแตกต่างระหว่าง 2 ระดับ
+
+| มิติ | Bot Kill Switch | Exchange Circuit Breaker |
+|---|---|---|
+| **ผู้ควบคุม** | นักลงทุน / Algorithm | หน่วยงานกำกับ / ตลาด |
+| **เป้าหมาย** | ปกป้องพอร์ตส่วนตัว | รักษาเสถียรภาพตลาดรวม |
+| **ความเร็ว** | Millisecond (real-time) | วินาที (ราคาต้องผ่าน threshold) |
+| **Scope** | เฉพาะ Account ของบอท | ทุก participant ในตลาด |
+| **Recovery** | User Reset หรือ Cooldown หมด | เวลาที่กำหนด (15–60 นาที) |
+| **ตัวอย่าง COMMANDER** | Equity Kill, CUSUM, VolatilityGate | ADL, COD, LULD (Binance) |
+
+**สรุปหลักการ:**
+> *Kill Switch ฝั่งบอท → ตัดก่อนพอร์ตพัง*
+> *Circuit Breaker ฝั่งตลาด → เบรกมือให้ทุกฝ่ายได้คิด*
+> *ทั้งสองระบบทำงานเสริมกัน ไม่ใช่แทนกัน*
+
+---
+
+## 🌐 18. Cloudflare Worker Proxy (IP Bypass)
+
+เมื่อ Google Cloud VPS IP ถูก Binance block — ส่ง request ผ่าน Cloudflare edge แทน
+
+### 18.1 ปัญหาและวิธีแก้
+
+```
+ปัญหา: Google Cloud IP range ถูก Binance กรองออก → API ตอบ 403 / Connection Refused
+วิธีแก้: มุด IP ผ่าน Cloudflare Worker (IP = CF Edge ไม่ใช่ Google Cloud)
+```
+
+**Architecture Flow:**
+```
+VPS (8.229.111.0)
+    │
+    ▼ HTTPS request
+Cloudflare Worker  (binance-proxy.regency2919.workers.dev)
+    │  X-Proxy-Secret: commander_proxy_secret_2026
+    │  X-MBX-APIKEY: forwarded
+    ▼
+Binance Futures API  (fapi.binance.com)
+    │
+    ▼ Response
+VPS ← Cloudflare ← Binance
+```
+
+### 18.2 การตั้งค่า
+
+**`.env` (เปิดใช้):**
+```env
+CF_WORKER_URL=https://binance-proxy.regency2919.workers.dev/proxy
+CF_PROXY_SECRET=commander_proxy_secret_2026
+```
+
+**ปิดใช้ (comment ออก):**
+```env
+# CF_WORKER_URL=https://binance-proxy.regency2919.workers.dev/proxy
+# CF_PROXY_SECRET=commander_proxy_secret_2026
+```
+
+### 18.3 Deploy Cloudflare Worker
+
+```bash
+# 1. ติดตั้ง Wrangler CLI
+npm install -g wrangler
+
+# 2. Login Cloudflare
+wrangler login
+
+# 3. Register workers.dev subdomain (ครั้งแรกเท่านั้น)
+#    ไปที่ https://dash.cloudflare.com → Workers & Pages → Register subdomain
+
+# 4. Set secret
+wrangler secret put PROXY_SECRET
+# พิมพ์: commander_proxy_secret_2026
+
+# 5. Deploy
+cd cloudflare-proxy
+wrangler deploy
+```
+
+**ผลลัพธ์:**
+```
+✅ Deployed: https://binance-proxy.regency2919.workers.dev
+```
+
+### 18.4 ทดสอบ Worker
+
+```bash
+# Health check
+curl https://binance-proxy.regency2919.workers.dev/health
+
+# ทดสอบ proxy (ต้องมี secret)
+curl -H "X-Proxy-Secret: commander_proxy_secret_2026" \
+     "https://binance-proxy.regency2919.workers.dev/proxy/fapi/v1/ping"
+```
+
+### 18.5 ข้อจำกัด Free Tier
+
+| ข้อจำกัด | Free Tier | ผลต่อบอท |
+|---|---|---|
+| Request/day | 100,000 | ~70 requests/นาที (เพียงพอมาก) |
+| CPU/request | 10ms | ไม่กระทบ (บอทไม่ใช้ heavy compute) |
+| Bandwidth | ไม่จำกัด | ✅ |
+| WebSocket | ❌ ไม่รองรับ | WebSocket ยังเชื่อมตรง Binance ตามเดิม |
+
+> **หมายเหตุ:** WebSocket streams (`stream_depth`, `stream_aggtrade`, `stream_user_data`) เชื่อมตรงกับ `wss://fstream.binance.com` เสมอ — CF Worker ใช้เฉพาะ REST API เท่านั้น
+
+### 18.6 ไฟล์ที่แก้ไข
+
+| ไฟล์ | การเปลี่ยนแปลง |
+|---|---|
+| `cloudflare-proxy/worker.js` | Worker script ใหม่ (Auth + Proxy logic) |
+| `cloudflare-proxy/wrangler.toml` | Deploy config (name, smart placement) |
+| `binance_global/async_client.py` | รับ `cf_worker_url`, `cf_proxy_secret` — เปลี่ยน URL target |
+| `shared/config.py` | เพิ่ม `CF_WORKER_URL`, `CF_PROXY_SECRET` จาก `.env` |
+| `.env` | ตั้งค่า Worker URL และ Secret |
+
+---
+
+*COMMANDER v2.2 — Institutional-grade Microstructure + Crisis Management + Cloudflare IP Bypass Edition*
+*Stack: Python 3.10+ · asyncio · aiohttp · Binance Futures API (REST + WebSocket L2 + aggTrade) · Cloudflare Workers · Windows / Ubuntu 22.04 LTS · Google Cloud e2-micro*
+*Concepts: OBI · OBI_deep · OFI · Trade OBI (OBI^T) · 3-Gate Spoof · Tiered Wall · 4-Gate OBI Flip · Dynamic Kill Switch · Regime Detector · VolatilityGate (σ/μ) · Dynamic Lot Sizing · Equity Kill Switch · Variance Age Exit · Max Daily Loss · Rapid-Fire Throttle · Flip Logger · Auto-Monitor · Token Bucket · Circuit Breaker · ADL · COD · CF Worker IP Bypass*
