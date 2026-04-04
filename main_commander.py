@@ -1399,11 +1399,18 @@ class MainCommandCenter:
 
             mark_data = await self.client_gl.get_mark_price(self.symbol)
             mark_p = safe_float(mark_data.get('markPrice')) if mark_data else self.current_price
-            
+
             usdt = next((a for a in acc['assets'] if a['asset'] == 'USDT'), None)  # pyre-ignore
             w_bal, a_bal = (safe_float(usdt['walletBalance']), safe_float(usdt['availableBalance'])) if usdt else (0.0, 0.0)  # pyre-ignore
             pos = next((p for p in acc['positions'] if p['symbol'] == self.symbol), None)  # pyre-ignore
             p_amt = safe_float(pos['positionAmt']) if pos else 0.0
+
+            # ดึง liquidationPrice จริงจาก positionRisk API
+            _pos_risk = None
+            if p_amt != 0:
+                _risk_data = await self.client_gl.get_position_risk(self.symbol)
+                if _risk_data and isinstance(_risk_data, list) and len(_risk_data) > 0:
+                    _pos_risk = _risk_data[0]
             
             m_icon = "🛡️ SAFE" if self.strategy_mode == "SAFE" else ("💸 PROFIT" if self.strategy_mode == "PROFIT" else "🔄 NORMAL")
             status_text = "🟢 ONLINE" if not self.gl_paused else "🔴 PAUSED"
@@ -1436,12 +1443,13 @@ class MainCommandCenter:
                 side_icon = "📈 LONG" if p_amt > 0 else "📉 SHORT"
                 pnl_icon = "🔥" if pnl >= 0 else "❄️"
                 
-                liq_p      = safe_float(pos.get('liquidationPrice', 0))
-                iso_margin = safe_float(pos.get('isolatedWallet', 0))
-                maint_m    = safe_float(pos.get('maintMargin', 0))
+                # ดึงจาก positionRisk (แม่นยำกว่า cached account)
+                liq_p        = safe_float(_pos_risk.get('liquidationPrice', 0)) if _pos_risk else 0.0
+                iso_margin   = safe_float(_pos_risk.get('isolatedWallet', 0)) if _pos_risk else safe_float(pos.get('isolatedWallet', 0))
+                maint_m      = safe_float(_pos_risk.get('maintMargin', 0)) if _pos_risk else safe_float(pos.get('maintMargin', 0))
                 margin_ratio = (maint_m / iso_margin * 100) if iso_margin > 0 else 0.0
-                liq_dist   = (mark_p - liq_p) / mark_p * 100 if liq_p > 0 and mark_p > 0 else 0.0
-                notional   = abs(p_amt) * mark_p
+                liq_dist     = (mark_p - liq_p) / mark_p * 100 if liq_p > 0 and mark_p > 0 else 0.0
+                notional     = abs(p_amt) * mark_p
                 margin_ratio_icon = "🔴" if margin_ratio >= 80 else ("🟡" if margin_ratio >= 50 else "🟢")
 
                 msg += f"🚀 *POSITION: {side_icon} | {abs(p_amt):.3f} BTC*\n"
