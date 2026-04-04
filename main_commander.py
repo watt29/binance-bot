@@ -184,21 +184,10 @@ class TelegramCommander:
                     await self.bot.update_strategy_parameters()
                     await self.send_message("🔄 *NORMAL Mode:* บอทตัดสินใจตามตลาดเอง\n✅ Equity Kill Switch ถูก Reset แล้วครับ")
                     await self.bot.send_combined_report()
-                # ── ควบคุม Bot ──
-                elif t in ("⏸️ หยุด", "⏸️ หยุดชั่วคราว"):
-                    await self.bot.set_pause(True)
-                elif t in ("▶️ รันต่อ", "▶️ เริ่มรันต่อ"):
-                    self.bot._equity_kill_active = False  # Reset Equity Kill Switch
-                    await self.bot.set_pause(False)
-                elif t in ("💥 ปิด Position", "💥 ปิดทุกออเดอร์"):
-                    await self.bot.emergency_close()
-                # ── ระบบ ──
-                elif t in ("🔄 Restart", "🔄 รีสตาร์ทบอท (PM2)"):
-                    await self.send_message("🔄 กำลัง Restart...")
-                    os.system("pm2 restart bot")
-                elif t in ("🛑 Stop Bot", "🛑 ปิดบอทถาวร (PM2 Stop)"):
-                    await self.send_message("🛑 *PM2 Stop* — ต้องเปิดเองที่เครื่องด้วย `pm2 start bot`")
-                    os.system("pm2 stop bot")
+                elif t == "🧮 วิเคราะห์ทางออก":
+                    await self.bot.send_exit_analysis()
+                elif t == "🔍 สแกนความเสี่ยง":
+                    await self.bot.send_risk_scan()
                 elif t == "/start":
                     await self._send_menu()
 
@@ -258,10 +247,8 @@ class TelegramCommander:
                 [{"text": "📊 พอร์ต"}, {"text": "💰 กำไรวันนี้"}, {"text": "📓 Flip Stats"}],
                 # ── แถว 2: เปลี่ยน Mode ──
                 [{"text": "🛡️ SAFE"}, {"text": "💸 PROFIT"}, {"text": "🔄 NORMAL"}],
-                # ── แถว 3: ควบคุม Bot ──
-                [{"text": "⏸️ หยุด"}, {"text": "▶️ รันต่อ"}, {"text": "💥 ปิด Position"}],
-                # ── แถว 4: ระบบ ──
-                [{"text": "🔄 Restart"}, {"text": "🛑 Stop Bot"}],
+                # ── แถว 3: วิเคราะห์ ──
+                [{"text": "🧮 วิเคราะห์ทางออก"}, {"text": "🔍 สแกนความเสี่ยง"}]
             ],
             "resize_keyboard": True
         }
@@ -285,7 +272,8 @@ class MainCommandCenter:
         self.last_close_time, self.last_buy_price = 0.0, 0.0
         self.current_price = 0.0
         self.price_buffer = [] 
-        self.maker_fee, self.taker_fee = 0.0002, 0.0005
+        # ใช้ BNB จ่าย fee → ลด 25% | maker 0.02%→0.015% | taker 0.05%→0.0375%
+        self.maker_fee, self.taker_fee = 0.00015, 0.000375
         self.min_qty, self.step_size, self.min_notional = 0.001, 0.001, 100.0
         self.p_prec, self.q_prec = 1, 3
         
@@ -295,6 +283,7 @@ class MainCommandCenter:
         self._cached_acc: Any = None
         self._last_acc_time = 0.0
         self._last_report_time = 0.0
+
 
         # 📊 ORDER BOOK IMBALANCE (Whale Signal)
         self._obi_score = 0.0          # -1.0 ถึง +1.0  (flat weight, Top 20)
@@ -334,6 +323,7 @@ class MainCommandCenter:
         #  outcome_price (ราคา 5 นาทีหลัง), outcome_delta (%), outcome_label}
         self._flip_pending_outcome: list = []  # รอ record outcome หลัง 5 นาที
         self._flip_log_path = "logs/flip_log.json"  # persist ข้ามรอบ restart
+        self._trailing_state_path = "logs/trailing_state.json"  # persist trailing state
 
         # 📚 LOCAL ORDER BOOK (Binance standard sync)
         self._lob_bids: dict = {}        # {price: qty}
@@ -419,9 +409,35 @@ class MainCommandCenter:
         self.next_buy_price = 0.0
         self.predicted_avg_price = 0.0
 
+        # 💰 MAKER REBATE TRACKING — บันทึกค่า fee ที่ประหยัดได้สะสม (GTX Maker vs Taker baseline)
+        # rebate per trade = (taker_fee - maker_fee) * notional
+        self._rebate_saved_total: float = 0.0   # สะสมตลอดอายุบอท (USDT)
+        self._rebate_session_start: float = time.time()  # เวลาเริ่ม session
+        self._rebate_trade_count: int = 0        # จำนวน Maker trades ที่สำเร็จ
+
+        # 🚫 OBI QUOTE CANCELLATION — เก็บ pending GTX order สำหรับตรวจ OBI หลังวาง
+        # เมื่อ OBI พลิกเสียเปรียบก่อน fill → cancel ทันที (ป้องกัน Adverse Selection)
+        self._pending_gtx_order: Optional[dict] = None  # {"orderId": str, "price": float, "placed_at": float}
+        self._gtx_cancel_obi_threshold: float = -0.45   # OBI ต่ำกว่านี้ → cancel
+        self._gtx_cancel_checked = False                 # ป้องกัน cancel loop
+
+        # 🔔 PRICE LEVEL ALERTS — แจ้งเตือนเมื่อราคาหลุดแนวรับสำคัญ
+        # ตั้งค่าได้ตลอด: list of (label, price, direction)
+        # direction: "below" = แจ้งเมื่อราคา < price, "above" = แจ้งเมื่อราคา > price
+        self.PRICE_ALERT_LEVELS: list = [
+            ("แนวรับ 1",  65938.0, "below"),
+            ("แนวรับ 2 ⚠️ LIQ ZONE", 64197.0, "below"),
+            ("แนวรับ 3",  62979.0, "below"),
+            ("แนวรับ 4",  61721.0, "below"),
+        ]
+        self._price_alert_triggered: set = set()  # label ที่แจ้งแล้ว (reset เมื่อราคาฟื้น)
+        self._price_alert_cooldown = 300.0         # cooldown วินาที (5 นาที)
+        self._price_alert_last_time: dict = {}     # {label: timestamp}
+
     async def run(self):
         if not os.path.exists("logs"): os.makedirs("logs")
         self._flip_log_load()
+        self._trailing_state_load()
         async with self.client_gl as client:
             success = await self._init_setup(client)
             if not success:
@@ -435,7 +451,8 @@ class MainCommandCenter:
                 self.client_gl.stream_ticker(self.symbol, self.price_update_callback),
                 self.client_gl.stream_depth(self.symbol, self.depth_update_callback),
                 self.client_gl.stream_aggtrade(self.symbol, self.aggtrade_callback),
-                self.listen_key_keepalive()
+                self.listen_key_keepalive(),
+                self.hourly_alert_task()
             ]
             
             if self.listen_key:
@@ -581,8 +598,9 @@ class MainCommandCenter:
                 _flip_regime, _ = self._get_regime()
 
                 # 📊 CHOPPY BYPASS: OBI Flip ใน CHOPPY = Mechanical rebalance ไม่ใช่ Informational signal
-                # Data: 88.9% FLAT outcome → Kill Switch ทำให้เสียโอกาส Grid/DCA โดยไม่จำเป็น
+                # Data (n=72): FLAT 60% / BOUNCE 22% / DUMP 18% → Kill Switch ทำให้เสียโอกาส Grid/DCA โดยไม่จำเป็น
                 # Volatility Spike Kill Switch ยังทำงานปกติทุก Regime
+                _ks_triggered = False
                 if _flip_regime == "CHOPPY":
                     logger.info(f"🟡 OBI FLIP BYPASSED (CHOPPY): {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} — Grid continues")
                 else:
@@ -595,6 +613,7 @@ class MainCommandCenter:
                     self._kill_switch = True
                     self._kill_time = now_flip  # Dynamic cooldown จะคำนวณใน _check_kill_switch
                     self._kill_reason = f"Triple Verified Flip (OFI {self._ofi_score:+.2f} / TradeOBI {self._trade_obi:+.2f})"
+                    _ks_triggered = True
                     _r, _rng = self._get_regime()
                     logger.warning(f"🚨 OBI FLIP TRIPLE-VERIFIED: {obi_recent_max:+.2f} → {self._obi_score:+.2f} | TradeOBI {self._trade_obi:+.2f} | Regime {_r}({_rng:.2f}%) | Cooldown {_flip_cd}s")
 
@@ -608,6 +627,7 @@ class MainCommandCenter:
                     "price": self.current_price,
                     "regime": _flip_regime,
                     "cooldown": _flip_cd,
+                    "ks_triggered": _ks_triggered,  # True = Kill Switch fired, False = CHOPPY bypass
                     "outcome_price": None,
                     "outcome_delta": None,
                     "outcome_label": None,
@@ -879,7 +899,18 @@ class MainCommandCenter:
             
             # 4. Set Leverage
             await client.change_leverage(self.symbol, self.leverage)
-            
+
+            # 4.5 ตรวจ + เปิด BNB Fee Burn อัตโนมัติ (ลด fee 25%)
+            try:
+                bnb_status = await client.get_bnb_burn_status()
+                if bnb_status and not bnb_status.get('spotBNBBurn', False):
+                    await client.set_bnb_burn(spot_bnb_burn=True, interest_bnb_burn=True)
+                    logger.info("🟡 BNB Fee Burn: เปิดอัตโนมัติแล้ว (ลด fee 25%)")
+                else:
+                    logger.info("🟡 BNB Fee Burn: เปิดอยู่แล้ว ✅")
+            except Exception as e:
+                logger.warning(f"🟡 BNB Fee Burn check skipped: {e}")
+
             # 5. Fetch Exchange Info for Precisions
             info = await client.get_exchange_info()
             if not info or 'symbols' not in info:
@@ -943,18 +974,43 @@ class MainCommandCenter:
                 self.target_net_profit_pct = (0.10 + (self.grid_step_pct * 0.10)) * self.leverage
             else: # NORMAL
                 self.target_net_profit_pct = (0.18 + (self.grid_step_pct * 0.2)) * self.leverage
+
+            # 📦 INVENTORY TP SCALING — Layer 8-9 เท่านั้นที่ลด TP เพื่อออกเร็วขึ้น
+            # Layer 1-7: TP ปกติ (100%) — ไม่แตะ
+            # Layer 8-9: TP ลดลง แต่ต้องคุ้มค่า fee สะสม (maker_fee × layers + maker_fee ปิด)
+            # หลักการ: ออกเร็วกว่า แต่ต้องไม่ขาดทุนจาก fee
+            if self.active_layers in (8, 9):
+                # คำนวณ fee floor: fee ซื้อทุก layer + fee ปิด (ทั้งหมดเป็น maker)
+                fee_floor_pct = (self.maker_fee * self.active_layers + self.maker_fee) * 100 * self.leverage
+                # TP ขั้นต่ำ = fee_floor × 1.3 (กำไรสุทธิ 30% เหนือ fee)
+                min_tp = fee_floor_pct * 1.3
+                self.target_net_profit_pct = max(min_tp, self.target_net_profit_pct * 0.65)
             return stats
         except Exception as e:
             logger.error(f"Update Params Error: {e}")
             return None
 
     async def trading_engine(self, client):
-        # 🟢 Wait for WebSocket to initialize price before first loop
+        # 🟢 Wait for WebSocket + Account cache to be ready before first loop
+        # ป้องกันบอทเปิดไม้ก่อน p_amt โหลดเสร็จ (เห็น p_amt=0 แล้วเปิดซ้ำ)
         await asyncio.sleep(3)
+        # รอ account cache พร้อมก่อน (force fetch)
+        for _attempt in range(10):
+            acc_check = await self._get_cached_account(force=True)
+            if acc_check and 'assets' in acc_check:
+                logger.info("✅ Startup: Account cache ready — เริ่ม trading loop")
+                break
+            logger.info(f"⏳ Startup: รอ account data... ({_attempt+1}/10)")
+            await asyncio.sleep(2)
         while True:
             try:
-                # ⚡ Heartbeat Log
+                # ⚡ Heartbeat Log + File (Watchdog อ่านจาก file แทน log parsing)
                 logger.info("⚡ Trading Loop Tick")
+                try:
+                    with open("logs/heartbeat.txt", "w") as _hb:
+                        _hb.write(str(time.time()))
+                except Exception:
+                    pass
                 if self.gl_paused: await asyncio.sleep(5); continue
 
                 # ใช้ราคาจาก WebSocket
@@ -1008,15 +1064,23 @@ class MainCommandCenter:
                 if p_amt == 0:
                     self.active_layers, self.trailing_active, self.last_buy_price = 0, False, 0.0
                     self._position_open_time = 0.0  # Reset age timer
-                    if (time.time() - self.last_close_time) > 60:
+
+                    # 🧠 Post-TP Cooldown Guard: ถ้าเพิ่ง recover จาก deep hole (Layer ≥8)
+                    # รอนานขึ้น (5 นาที) และต้องการ OBI แข็งแกร่งกว่าปกติก่อนเปิดรอบใหม่
+                    post_tp_cooldown = 300.0 if getattr(self, '_last_closed_from_high_layer', False) else 60.0
+                    obi_threshold = 0.1 if getattr(self, '_last_closed_from_high_layer', False) else -0.3
+
+                    if (time.time() - self.last_close_time) > post_tp_cooldown:
+                        self._last_closed_from_high_layer = False  # reset flag
                         p_range = (cur_p - stats['low']) / (stats['high'] - stats['low']) * 100 if stats['high'] > stats['low'] else 50  # pyre-ignore
                         # 📊 OBI+OFI Filter: ไม่เปิดไม้แรกถ้าแรงขายหนักมาก และ OFI ยืนยัน
                         # Deep OBI (Top 5 + distance-weighted) ยืนยันว่าแรงขายจริงไม่ใช่ Spoof จากระดับไกล
-                        obi_ok = (self._obi_score >= -0.3 or self._obi_last_update == 0) and self._obi_confirmed() and (self._obi_deep >= -0.35 or self._obi_last_update == 0)
+                        obi_ok = (self._obi_score >= obi_threshold or self._obi_last_update == 0) and self._obi_confirmed() and (self._obi_deep >= -0.35 or self._obi_last_update == 0)
                         if p_range < 85 and inst_vol < 0.4 and obi_ok and vgate_ok and not self._daily_kill_active:
                             if a_bal >= (lot_u / self.leverage): await self._execute_trade(client, "BUY", lot_u)
                 else:
-                    self.active_layers = max(1, int(round((abs(p_amt) * entry_p) / lot_u)))
+                    # ใช้ base_lot_u (ไม่ scale) เพื่อนับ layer จริง — ป้องกัน circular dependency
+                    self.active_layers = max(1, int(round((abs(p_amt) * entry_p) / base_lot_u)))
 
                     # 🔄 Auto-recover strategy_mode จาก layer count (ป้องกัน reset เป็น NORMAL ตอน restart)
                     if self.last_buy_price <= 0 and self.strategy_mode == "NORMAL":
@@ -1047,12 +1111,60 @@ class MainCommandCenter:
                         await asyncio.sleep(5)
                         continue
 
-                    # 🚀 [HOTFIX] ฟื้นฟู Session: ถ้าบอทเพิ่งเปิดใหม่และมีของติดลบอยู่ ห้ามคำนวณจาก entry_p เด็ดขาด!
+                    # 🚀 [HOTFIX] ฟื้นฟู Session: ใช้ entry_p แทน cur_p
                     if self.last_buy_price <= 0:
-                        self.last_buy_price = cur_p
-                        logger.info("🔄 Recovered Session: Set last_buy_price to current price to prevent instant duplicate buy.")
+                        self.last_buy_price = entry_p if entry_p > 0 else cur_p
+                        logger.info(f"🔄 Recovered Session: last_buy_price = ${self.last_buy_price:,.2f} (entry_p)")
 
-                    logger.info(f"📊 Calc: Amt {p_amt} * Entry {entry_p} / Lot {lot_u:.0f} (scale {lot_scale:.0%}) = Layers {self.active_layers}")
+                    # 🚫 OBI QUOTE CANCELLATION — ตรวจ pending GTX order ว่า OBI พลิกหรือยัง
+                    # ถ้า OBI ต่ำกว่า threshold → cancel ทันที ป้องกัน Adverse Selection
+                    if self._pending_gtx_order and not self._gtx_cancel_checked:
+                        order_age = time.time() - self._pending_gtx_order["placed_at"]
+                        obi_now = self._obi_score
+                        # ตรวจหลังจากวาง 3 วินาที (ให้เวลา OB update) และก่อน 30 วินาที
+                        if 3 <= order_age <= 30 and obi_now < self._gtx_cancel_obi_threshold:
+                            try:
+                                cancel_res = await client.cancel_all_open_orders(self.symbol)
+                                logger.warning(
+                                    f"🚫 OBI Quote Cancel: OBI={obi_now:+.2f} < {self._gtx_cancel_obi_threshold} "
+                                    f"(order age {order_age:.0f}s) → ยกเลิก GTX order {self._pending_gtx_order['orderId']}"
+                                )
+                                await self.tg.send_message(
+                                    f"🚫 *OBI Quote Cancel*\n"
+                                    f"OBI พลิกเป็น `{obi_now:+.2f}` หลังวาง GTX\n"
+                                    f"ยกเลิก order แล้ว — ป้องกัน Adverse Selection"
+                                )
+                                self._pending_gtx_order = None
+                                self._gtx_cancel_checked = True
+                            except Exception as ce:
+                                logger.warning(f"OBI Cancel Error: {ce}")
+                        elif order_age > 30:
+                            # order น่าจะ fill แล้ว หรือ EXPIRED แล้ว → ล้าง pending
+                            self._pending_gtx_order = None
+
+                    # 🏛️ MARGIN RATIO MONITOR (Real-time Portfolio Monitoring)
+                    total_maint_mm = safe_float(acc.get('totalMaintMargin', 0))
+                    total_margin_bal = safe_float(acc.get('totalMarginBalance', 1))
+                    m_ratio = (total_maint_mm / total_margin_bal) * 100 if total_margin_bal > 0 else 0.0
+
+                    # 🚨 80/90% Alert Logic (Step-down monitoring)
+                    if m_ratio >= 80:
+                        alert_type = "DANGER 🚨" if m_ratio >= 90 else "WARNING ⚠️"
+                        last_alert_time = getattr(self, "_margin_alert_last_time", 0)
+                        # ส่งแจ้งเตือนทุก 15 นาที หรือเมื่อข้ามจาก Warning เป็น Danger
+                        if time.time() - last_alert_time > 900 or (m_ratio >= 90 and getattr(self, "_margin_alert_level", 0) < 90):
+                            await self.tg.send_message(
+                                f"{alert_type} *MARGIN CALL ADVISORY*\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"🏦 พอร์ตของคุณเข้าเขตเสี่ยงสูงครับ!\n"
+                                f"📊 Margin Ratio: `{m_ratio:.2f}%`\n"
+                                f"💰 Wallet Balance: `${w_bal:,.2f}`\n"
+                                f"🛡️ *แนะนำ:* พิจารณาเติมมาร์จิ้นส่วนกลาง หรือปิดบางเหรียญเพื่อลด Risk ครับ"
+                            )
+                            self._margin_alert_last_time = time.time()
+                            self._margin_alert_level = 90 if m_ratio >= 90 else 80
+
+                    logger.info(f"📊 Calc: Amt {p_amt} * Entry {entry_p} / Lot {lot_u:.0f} (scale {lot_scale:.0%}) = Layers {self.active_layers} (M.Ratio: {m_ratio:.1f}%)")
                     layer_mult = 1.0 + (max(0, self.active_layers - 3) * 0.25)
                     final_step = self.grid_step_pct * layer_mult
                     
@@ -1069,24 +1181,36 @@ class MainCommandCenter:
                         await self.tg.send_message(f"⚠️ *Inventory Toxic!* ขาดทุนเกิน `{self.INV_MAX_LOSS_PCT}%` ของ margin\nพิจารณาปิด Position ด้วยตนเองครับ")
                         self._last_report_time = time.time()
 
-                    # 🔔 แจ้งเตือนล่วงหน้าเมื่อราคาใกล้ถึง next buy (ภายใน 1%)
-                    if self.next_buy_price > 0:
-                        dist_to_buy = (cur_p - self.next_buy_price) / cur_p * 100
-                        if 0 < dist_to_buy <= 1.0:
-                            alert_key = f"near_buy_{int(self.next_buy_price / 10) * 10}"
-                            if (time.time() - self._last_report_time) > 120:
+
+                    # 🔔 PRICE LEVEL ALERT — ตรวจแนวรับสำคัญ
+                    if self.PRICE_ALERT_LEVELS:
+                        now_pa = time.time()
+                        for (pa_label, pa_price, pa_dir) in self.PRICE_ALERT_LEVELS:
+                            triggered = (pa_dir == "below" and cur_p < pa_price) or \
+                                        (pa_dir == "above" and cur_p > pa_price)
+                            last_pa_time = self._price_alert_last_time.get(pa_label, 0)
+                            if triggered and (now_pa - last_pa_time) > self._price_alert_cooldown:
+                                self._price_alert_last_time[pa_label] = now_pa
+                                dist_pct = abs(cur_p - pa_price) / pa_price * 100
                                 await self.tg.send_message(
-                                    f"⚠️ *ราคาใกล้ถึงจุดซื้อไม้ {self.active_layers + 1}!*\n"
-                                    f"ราคาปัจจุบัน: `${cur_p:,.1f}`\n"
-                                    f"จุดซื้อ: `${self.next_buy_price:,.1f}`\n"
-                                    f"ห่างอีก: `{dist_to_buy:.2f}%`\n"
-                                    f"เงินพร้อม: `${a_bal:.2f}` USDT"
+                                    f"🔴 *PRICE ALERT — หลุดแนวรับ!*\n"
+                                    f"ระดับ: `{pa_label}`\n"
+                                    f"เป้า: `${pa_price:,.1f}`\n"
+                                    f"ปัจจุบัน: `${cur_p:,.1f}` ({dist_pct:.2f}% ใต้แนวรับ)\n"
+                                    f"{'🚨 *ใกล้ Liquidation Price มาก!*' if 'LIQ' in pa_label else ''}"
                                 )
-                                self._last_report_time = time.time()
+                                logger.warning(f"🔔 PRICE ALERT: {pa_label} @ ${pa_price:,.1f} | cur=${cur_p:,.1f}")
 
                     # 🛡️ EQUITY KILL SWITCH: ตรวจ Drawdown และ Emergency Balance ก่อน DCA
                     pnl_usdt_check = safe_float(pos['unrealizedProfit']) if pos else 0.0
-                    equity_drawdown_pct = pnl_usdt_check / max(a_bal + abs(pnl_usdt_check), 1.0)
+                    # FIXED: ใช้ Wallet Balance (w_bal) เป็นตัวหารเพื่อความแม่นยำ
+                    equity_drawdown_pct = pnl_usdt_check / max(w_bal, 1.0)
+                    
+                    # [NEW] Auto-Reset Equity Kill if recovered (Drawdown < -15%)
+                    if self._equity_kill_active and equity_drawdown_pct > -0.15:
+                        self._equity_kill_active = False
+                        logger.info(f"🛡️ EQUITY KILL AUTO-RESET: Drawdown recovered to {equity_drawdown_pct*100:.1f}%")
+                        await self.tg.send_message("🛡️ *EQUITY KILL AUTO-RESET:*\nตลาดฟื้นตัวจน Drawdown ต่ำกว่า `-15%` แล้ว\nบอทกลับมาทำงาน (DCA) ตามปกติครับ")
                     if not self._equity_kill_active and equity_drawdown_pct <= self.EQUITY_DRAWDOWN_LIMIT:
                         self._equity_kill_active = True
                         logger.warning(f"🛡️ EQUITY KILL: Drawdown {equity_drawdown_pct*100:.1f}% เกิน {self.EQUITY_DRAWDOWN_LIMIT*100:.0f}% → หยุด DCA + ยกเลิก Orders ทั้งหมด")
@@ -1130,28 +1254,58 @@ class MainCommandCenter:
                                 self._last_report_time = time.time()
                     
                     pnl_pct = (((cur_p - entry_p) / entry_p * 100) * self.leverage)
-                    be_p = entry_p * ((1 + self.maker_fee) / (1 - self.taker_fee))
+                    # 💰 Fee-aware Break-Even: รวม fee ทุก layer ที่ซื้อมา (taker) + fee ตอนปิด (taker)
+                    # total_fee_pct = (layers_ซื้อ × taker_fee) + taker_fee_ปิด
+                    total_buy_fee = self.taker_fee * self.active_layers  # fee ซื้อสะสม
+                    close_fee = self.taker_fee                            # fee ปิด 1 ครั้ง
+                    be_p = entry_p * (1 + total_buy_fee + close_fee)
                     pnl_usdt = safe_float(pos['unrealizedProfit']) if pos else 0.0
 
                     # 🤖 AUTO-MONITOR: ตรวจสอบและตัดสินใจอัตโนมัติ
                     await self._auto_monitor(client, p_amt, pnl_usdt, entry_p)
 
-                    if pnl_pct >= self.target_net_profit_pct:
-                        if not self.trailing_active: self.trailing_active, self.peak_price = True, cur_p
-                        if cur_p > self.peak_price: self.peak_price = cur_p
-                    
+                    # 🔒 PROFIT LOCK TRAILING
+                    # Layer 1-5: activate เมื่อถึง target_net_profit_pct (เดิม)
+                    # Layer 6+:  activate เมื่อ PNL > $2 (ปกป้องกำไรที่ recover มาจาก deep hole)
+                    profit_lock_trigger = pnl_usdt > 2.0 and self.active_layers >= 6
+                    if pnl_pct >= self.target_net_profit_pct or profit_lock_trigger:
+                        if not self.trailing_active:
+                            self.trailing_active, self.peak_price = True, cur_p
+                            if profit_lock_trigger and pnl_pct < self.target_net_profit_pct:
+                                logger.info(f"🔒 Profit Lock Trailing activated: PNL ${pnl_usdt:.2f} (Layer {self.active_layers})")
+                            self._trailing_state_save()
+                        if cur_p > self.peak_price:
+                            self.peak_price = cur_p
+                            self._trailing_state_save()
+
+                    # 📊 Trailing distance — Layer สูง ใช้ distance กว้างขึ้น (ให้ราคาหายใจ)
+                    # Layer 1-5: 0.05% | Layer 6-9: 0.15% | Layer 10+: 0.25%
+                    if self.active_layers >= 10:
+                        trail_dist = 0.0025
+                    elif self.active_layers >= 6:
+                        trail_dist = 0.0015
+                    else:
+                        trail_dist = 0.0005
+
+                    trailing_trigger = self.peak_price * (1 - trail_dist)
+
                     # 📊 OBI Boost: ถ้า trailing active และ OBI < -0.6 (แรงขายหนักมาก) → ปิดเร็วขึ้น
-                    trailing_trigger = self.peak_price * 0.9995
                     if self.trailing_active and self._obi_score <= -0.6:
-                        trailing_trigger = self.peak_price * 0.9998  # ปิดเร็วขึ้นเมื่อวาฬขาย
+                        trailing_trigger = self.peak_price * (1 - trail_dist / 2)  # ปิดเร็วขึ้นเมื่อวาฬขาย
 
                     if self.trailing_active and cur_p <= trailing_trigger:
                         if cur_p > be_p:
+                            await self.tg.send_message(
+                                f"🔒 *PROFIT LOCK*: ราคาร่วงจาก Peak `${self.peak_price:,.0f}` → `${cur_p:,.0f}` ({trail_dist*100:.2f}%)\n"
+                                f"💰 PNL: `${pnl_usdt:.2f}` → ปิด Position เพื่อรักษากำไร!"
+                            )
                             await self._execute_trade(client, "SELL", abs(p_amt), True)
                             self.last_close_time = time.time()
                             self.active_layers, self.trailing_active = 0, False
-                            self._monitor_last_alert = {"type": None, "pnl": 0.0, "layers": 0}  # 🔄 Reset monitor for next cycle
-                        else: self.trailing_active = False
+                            self._monitor_last_alert = {"type": None, "pnl": 0.0, "layers": 0}
+                        else:
+                            self.trailing_active = False
+                            self._trailing_state_save()
                 
                 await asyncio.sleep(5)
             except Exception as e:
@@ -1179,13 +1333,16 @@ class MainCommandCenter:
                 params = {'order_type': 'LIMIT', 'timeInForce': 'GTX', 'quantity': f"{qty:.{self.q_prec}f}", 'price': f"{limit_p:.{self.p_prec}f}"}
             
             res = await client.create_order(self.symbol, side, **params)
-            if res and res.get('orderId'):
+            order_status = res.get('status') if res else None
+            # GTX (Post-Only) จะ return status=EXPIRED ถ้า reject — ไม่นับว่าสำเร็จ
+            order_filled = res and res.get('orderId') and order_status not in ('EXPIRED', 'CANCELED', 'REJECTED', None)
+            if order_filled:
                 # ⚡ บันทึก timestamp สำหรับ Rapid-Fire Throttle
                 self._order_timestamps.append(time.time())
                 if is_close:
                     self.last_close_time = time.time()
+                    self._pending_gtx_order = None  # ปิดแล้ว ล้าง pending
                     # 📅 บันทึก Realized PnL สำหรับ Daily Loss Tracker
-                    # ประมาณ PnL = (cur_p - entry_p) * qty * leverage (sign = side)
                     try:
                         acc_snap = await self._get_cached_account(force=True)
                         pos_snap = next((p for p in acc_snap.get('positions', []) if p['symbol'] == self.symbol), None) if acc_snap else None
@@ -1196,9 +1353,30 @@ class MainCommandCenter:
                         pass
                 else:
                     self.last_buy_price = cur_p
+                    # 💰 MAKER REBATE TRACKING: บันทึกค่า fee ที่ประหยัดได้
+                    # GTX (Maker) fee = maker_fee | baseline ถ้าใช้ Market = taker_fee
+                    # notional = qty * cur_p
+                    if not is_close:
+                        raw_q = amt / cur_p
+                        notional = math.floor(raw_q / self.step_size) * self.step_size * cur_p
+                        rebate = (self.taker_fee - self.maker_fee) * notional
+                        self._rebate_saved_total += rebate
+                        self._rebate_trade_count += 1
+                        logger.info(f"💰 Maker Rebate: +${rebate:.4f} | สะสม ${self._rebate_saved_total:.4f} ({self._rebate_trade_count} trades)")
+                    # 🚫 เก็บ pending GTX order สำหรับ OBI Cancel check
+                    if res and res.get('orderId') and not is_close:
+                        self._pending_gtx_order = {
+                            "orderId": str(res['orderId']),
+                            "price": cur_p,
+                            "placed_at": time.time()
+                        }
+                        self._gtx_cancel_checked = False
                 await self.tg.send_message(f"{'🔴 ปิด' if is_close else '🔵 เปิด (GTX)'} สำเร็จ!")
                 # Force refresh account after trade
                 await self._get_cached_account(force=True)
+            elif res and res.get('orderId') and order_status == 'EXPIRED':
+                logger.warning(f"GTX Order EXPIRED (Post-Only Rejected): {res.get('orderId')} — ไม่อัปเดต last_buy_price")
+                self._pending_gtx_order = None
             else:
                 logger.error(f"Order Failed: {res}")
         except Exception as e:
@@ -1247,8 +1425,9 @@ class MainCommandCenter:
                 
                 pnl = safe_float(pos['unrealizedProfit']) if pos else 0.0
                 pnl_p = (pnl / (abs(p_amt) * entry_p / self.leverage)) * 100 if entry_p > 0 else 0.0
-                be_p = entry_p * ((1 + self.maker_fee) / (1 - self.taker_fee))
-                
+                layers_now = max(1, int(round((abs(p_amt) * entry_p) / c_lot_u))) if c_lot_u > 0 else 1
+                be_p = entry_p * (1 + self.taker_fee * layers_now + self.taker_fee)
+
                 side_icon = "📈 LONG" if p_amt > 0 else "📉 SHORT"
                 pnl_icon = "🔥" if pnl >= 0 else "❄️"
                 
@@ -1309,6 +1488,10 @@ class MainCommandCenter:
             regime_icon = {"CHOPPY": "↔️", "VOLATILE": "⚡", "TRENDING": "📈", "WARMING": "🌡️", "UNKNOWN": "❓", "ERROR": "⚠️"}.get(regime, "❓")
             msg += f"🧭 *Regime:* `{regime_icon} {regime}` (`{rng:.4f}%` range) | Trade OBI: `{self._trade_obi:+.2f}`\n"
             msg += f"━━━━━━━━━━━━━━━━━━\n"
+            # 💰 MAKER REBATE SUMMARY
+            session_hrs = (time.time() - self._rebate_session_start) / 3600
+            msg += f"💰 *Maker Rebate Saved:* `${self._rebate_saved_total:.4f}` ({self._rebate_trade_count} trades, {session_hrs:.1f}h)\n"
+            msg += f"━━━━━━━━━━━━━━━━━━\n"
             msg += f"🐳 *Whale Signal:* {self._get_whale_signal()}"
             
             await self.tg.send_message(msg)
@@ -1368,6 +1551,282 @@ class MainCommandCenter:
         except Exception as e:
             logger.error(f"Trade Report Error: {e}")
             await self.tg.send_message("❌ ไม่สามารถดึงรายงานกำไรได้ในขณะนี้")
+
+    async def send_exit_analysis(self, is_auto=False):
+        """🧮 วิเคราะห์ทางออก: คำนวณทางเลือก Cut Loss / รอ / DCA"""
+        try:
+            # ใช้ Cache Account
+            acc = await self._get_cached_account()
+            if not acc or 'positions' not in acc:
+                if not is_auto: await self.tg.send_message("⚠️ ไม่สามารถดึงข้อมูลพอร์ตได้ในขณะนี้")
+                return
+
+            pos = next((p for p in acc['positions'] if p['symbol'] == self.symbol), None)
+            p_amt_raw = safe_float(pos['positionAmt']) if pos else 0.0
+            if p_amt_raw == 0:
+                if not is_auto: await self.tg.send_message("💤 *ไม่มี Position ค้างอยู่ครับ*")
+                return
+
+            p_amt = abs(p_amt_raw)
+            side = "LONG" if p_amt_raw > 0 else "SHORT"
+            entry_p = safe_float(pos['entryPrice'])
+            cur_p = self.current_price
+            if cur_p <= 0:
+                ticker = await self.client_gl.get_ticker(self.symbol)
+                cur_p = safe_float(ticker.get('price')) if ticker else 0.0
+
+            pnl = safe_float(pos['unrealizedProfit'])
+            usdt = next((a for a in acc['assets'] if a['asset'] == 'USDT'), None)
+            w_bal = safe_float(usdt['walletBalance']) if usdt else 1.0
+            a_bal = safe_float(usdt['availableBalance']) if usdt else 0.0
+            
+            # คำนวณ % ขาดทุนเทียบกับ Margin
+            margin_used = (p_amt * entry_p) / self.leverage
+            pnl_p = (pnl / margin_used) * 100 if margin_used > 0 else 0.0
+
+            # 🛠️ 1. Scenario A: ปิดทันที (Cut Loss)
+            remaining_bal = w_bal + pnl
+
+            # 🛠️ 2. Scenario B: รอราคากลับ (Break-Even) — รวม fee ทุก layer
+            cur_layers = max(1, int(round((p_amt * entry_p) / (self.leverage * 500)))) if entry_p > 0 else 1
+            total_fee = self.taker_fee * cur_layers + self.taker_fee  # fee ซื้อสะสม + fee ปิด
+            if side == "LONG":
+                be_p = entry_p * (1 + total_fee)
+                needed_pct = (be_p - cur_p) / cur_p * 100 if cur_p > 0 else 0.0
+            else:
+                be_p = entry_p * (1 - total_fee)
+                needed_pct = (cur_p - be_p) / cur_p * 100 if cur_p > 0 else 0.0
+
+            # 🛠️ 3. Scenario C: DCA เพิ่ม (ใช้ Avail ทั้งหมด)
+            if a_bal > 1.0:
+                dca_lot_u = a_bal * self.leverage
+                dca_qty = dca_lot_u / cur_p
+                new_qty = p_amt + dca_qty
+                new_layers = cur_layers + 1
+                new_total_fee = self.taker_fee * new_layers + self.taker_fee
+
+                if side == "LONG":
+                    new_entry = (p_amt * entry_p + dca_lot_u) / new_qty
+                    new_be_p = new_entry * (1 + new_total_fee)
+                    new_needed_pct = (new_be_p - cur_p) / cur_p * 100 if cur_p > 0 else 0.0
+                else:
+                    new_entry = (p_amt * entry_p + dca_qty * cur_p) / new_qty
+                    new_be_p = new_entry * (1 - new_total_fee)
+                    new_needed_pct = (cur_p - new_be_p) / cur_p * 100 if cur_p > 0 else 0.0
+            else:
+                new_entry, new_be_p, new_needed_pct = 0, 0, 0
+
+            msg = "🧮 *วิเคราะห์ทางออก (EXIT ANALYSIS)*\n"
+            if is_auto:
+                msg = "🔔 *AUTO-ADVISOR: คำแนะนำรายชั่วโมง*\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"🚀 Position: `{side} {p_amt:.3f} BTC`\n"
+            msg += f"Entry: `${entry_p:,.2f}`\n"
+            msg += f"PNL: `${pnl:,.2f}` (`{pnl_p:+.2f}%`)\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            
+            # Scenario A
+            msg += f"🔴 *Scenario A: ปิดทันที*\n"
+            msg += f"└ ขาดทุน: `${abs(pnl):,.2f}` | เหลือทุน: `${remaining_bal:,.2f}`\n\n"
+            
+            # Scenario B
+            msg += f"🟡 *Scenario B: ถือรอ (No DCA)*\n"
+            msg += f"└ ต้อง{'ขึ้น' if side == 'LONG' else 'ลง'}อีก: `+{needed_pct:.2f}%` (ถึง `${be_p:,.2f}`)\n\n"
+            
+            # Scenario C
+            if a_bal > 1.0:
+                msg += f"🟢 *Scenario C: DCA สู้ (ใช้เงิน `${a_bal:.1f}`)*\n"
+                msg += f"└ Entry ใหม่: `${new_entry:,.2f}`\n"
+                msg += f"└ ต้อง{'ขึ้น' if side == 'LONG' else 'ลง'}อีก: `+{new_needed_pct:.2f}%` (ถึง `${new_be_p:,.2f}`)\n"
+            else:
+                msg += f"⚪ *Scenario C: DCA (เงินไม่พอ)*\n"
+                msg += f"└ กรุณาเติมเงินเพื่อลด Entry เฉลี่ยครับ\n"
+            
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            
+            # 💡 Recommendation
+            rec = "⏳ *แนะนำ:* ตลาดผันผวนสูง แนะนำ 'ถือรอ' และเฝ้า Liq. Price"
+            if pnl_p <= -50:
+                rec = "🚨 *แนะนำ:* ขาดทุนหนัก (Toxic) พิจารณา 'Cut Loss' เพื่อรักษาทุนที่เหลือ"
+            elif needed_pct <= 0.6:
+                rec = "✅ *แนะนำ:* ใกล้คุ้มทุนมากแล้ว แนะนำ 'รอ' หรือตั้ง TP/BE ไว้ครับ"
+            elif a_bal >= 30 and (needed_pct - new_needed_pct) > 0.5:
+                rec = "💪 *แนะนำ:* หากมีเงินสำรอง การ 'DCA' จะช่วยให้หลุดได้ไวขึ้นมาก"
+            
+            msg += f"💡 {rec}\n\n"
+            
+            # 🏛️ 4. TOP-UP ADVISOR & MARGIN MONITOR (Smart Cross/Iso Support)
+            liq_p = safe_float(pos.get('liquidationPrice', 0))
+            margin_type = pos.get('marginType', 'isolated').lower()
+            maint_margin = safe_float(pos.get('maintMargin', 0))
+            
+            # ดึงข้อมูลภาพรวมพอร์ต (สำหรับ Cross Margin Monitor)
+            total_maint_margin = safe_float(acc.get('totalMaintMargin', 0))
+            total_margin_balance = safe_float(acc.get('totalMarginBalance', 1))
+            margin_ratio = (total_maint_margin / total_margin_balance) * 100 if total_margin_balance > 0 else 0.0
+
+            msg += "💰 *วิเคราะห์หลักประกัน (MARGIN INSIGHT)*\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"🏦 โหมด: `{margin_type.upper()}`\n"
+            msg += f"📊 Margin Ratio: `{margin_ratio:.2f}%` "
+            
+            # บันไดการแจ้งเตือน (Margin Ratio Warning)
+            if margin_ratio >= 90:
+                msg += "🚨 *CRITICAL*"
+            elif margin_ratio >= 80:
+                msg += "⚠️ *WARNING*"
+            else:
+                msg += "✅ *SAFE*"
+            msg += "\n"
+
+            if liq_p > 0 and abs(p_amt) > 0:
+                # --- ส่วนที่ 1: เติมเพื่อความปลอดภัย (Safety Buffer 10-15% สำหรับ Cross) ---
+                # ปรับ Buffer ตามคำแนะนำ (Cross ใช้ 15%, Iso ใช้ 5%)
+                buffer_rate = 0.15 if margin_type == "cross" else 0.05
+                target_liq_safe = cur_p * ((1 - buffer_rate) if side == "LONG" else (1 + buffer_rate))
+                
+                # คำนวณ Margin ที่ต้องการ
+                if margin_type == "isolated":
+                    iso_margin = safe_float(pos.get('isolatedWallet', 0))
+                    if side == "LONG":
+                        margin_needed_safe = (entry_p - target_liq_safe) * p_amt
+                    else:
+                        margin_needed_safe = (target_liq_safe - entry_p) * p_amt
+                    top_up_safe = max(0.0, margin_needed_safe - iso_margin)
+                else:
+                    # 🧠 สูตร Cross Margin เฉพาะทาง (อิงตามหลักการของคุณ):
+                    # กำไร (UnPnl > 0) จะไม่ถูกนำมารวบหลักประกันเพื่อป้องกันความเสี่ยง
+                    pnl_for_collateral = min(0.0, pnl) # ถ้ากำไรให้เป็น 0, ถ้าขาดทุนให้ติดลบจริง
+                    effective_avail = a_bal # Available Balance จาก API รวม UnPnl ติดลบมาให้แล้วตามมาตรฐานกระดาน
+                    
+                    if side == "LONG":
+                        # ส่วนต่างมาร์จิ้นที่ขาดหายไปเพื่อให้ Liq ไปถึงเป้าหมาย
+                        margin_gap = (entry_p - target_liq_safe) * p_amt
+                        top_up_safe = max(0.0, margin_gap - effective_avail)
+                    else:
+                        margin_gap = (target_liq_safe - entry_p) * p_amt
+                        top_up_safe = max(0.0, margin_gap - effective_avail)
+                
+                # --- ส่วนที่ 2: เติมเพื่อหลุดดอยไว (Recovery Target 1% BE) ---
+                target_be = cur_p * (1.008 if side == "LONG" else 0.992)
+                if side == "LONG":
+                    target_entry = target_be / ((1 + self.maker_fee) / (1 - self.taker_fee))
+                    denom = (1 - target_entry/cur_p)
+                    top_up_recovery = (p_amt * (target_entry - entry_p) / denom) if abs(denom) > 1e-6 else 0.0
+                else:
+                    target_entry = target_be / ((1 - self.maker_fee) / (1 + self.taker_fee))
+                    denom = (target_entry/cur_p - 1)
+                    top_up_recovery = (p_amt * (entry_p - target_entry) / denom) if abs(denom) > 1e-6 else 0.0
+
+                top_up_recovery = max(0.0, top_up_recovery - a_bal)
+                
+                # คำนวณจำนวนไม้
+                base_lot_margin = (max(200.0, min((w_bal * 0.8 / 5) * self.leverage, 500.0))) / self.leverage
+                layers_safe = math.ceil(top_up_safe / base_lot_margin) if base_lot_margin > 0 else 0
+                layers_recovery = math.ceil(top_up_recovery / base_lot_margin) if base_lot_margin > 0 else 0
+
+                msg += f"🛡️ *Safety Layer ({buffer_rate*100:.0f}% Buffer):*\n"
+                if top_up_safe > 0:
+                    msg += f"└ เติมเพิ่ม: `${top_up_safe:,.2f}` (~ `{layers_safe}` ไม้)\n"
+                else:
+                    msg += f"└ ✅ ปลอดภัย (ห่างเป้าหมาย {buffer_rate*100:.0f}%)\n"
+                
+                msg += f"\n🚀 *Recovery Layer (BE 1.0%):*\n"
+                if top_up_recovery > 0:
+                    msg += f"└ เติมเพิ่ม: `${top_up_recovery:,.2f}` (~ `{layers_recovery}` ไม้)\n"
+                else:
+                    msg += f"└ ✅ ใกล้หลุดดอยแล้ว ไม่ต้องเติมเพิ่ม\n"
+                
+                msg += "━━━━━━━━━━━━━━━━━━\n"
+                msg += "⚠️ *Calculated Logic:* ใช้ข้อมูล Wallet Balance (WB) และ Total Maint. Margin (TMM) แบบ Real-time ตรวจสอบความถูกต้องก่อนเติมเงินจริงครับ"
+
+            await self.tg.send_message(msg)
+            
+        except Exception as e:
+            logger.error(f"Exit Analysis Error: {e}")
+
+    async def send_risk_scan(self):
+        """🔍 สแกนความเสี่ยง: ตรวจสอบสุขภาพพอร์ตภาพรวม (Portfolio Health Scan)"""
+        try:
+            acc = await self._get_cached_account()
+            if not acc:
+                await self.tg.send_message("⚠️ ไม่สามารถดึงข้อมูลพอร์ตได้ในขณะนี้")
+                return
+
+            # ดึงข้อมูลจากกระเป๋า USDT
+            usdt = next((a for a in acc['assets'] if a['asset'] == 'USDT'), None)
+            w_bal = safe_float(usdt['walletBalance']) if usdt else 0.0
+            a_bal = safe_float(usdt['availableBalance']) if usdt else 0.0
+            m_bal = safe_float(usdt['marginBalance']) if usdt else 0.0
+            mm = safe_float(usdt['maintMargin']) if usdt else 0.0
+            m_ratio = (mm / m_bal) * 100 if m_bal > 0 else 0.0
+            unpnl = safe_float(usdt['unrealizedProfit']) if usdt else 0.0
+
+            # 🌡️ กำหนดระดับความปลอดภัย
+            status_icon = "✅"
+            status_text = "SAFE (ปลอดภัยดีมาก)"
+            if m_ratio >= 90:
+                status_icon = "🚨"
+                status_text = "CRITICAL (เข้าเขตอันตราย!)"
+            elif m_ratio >= 80:
+                status_icon = "⚠️"
+                status_text = "CAUTION (ระวังเป็นพิเศษ)"
+            elif m_ratio >= 50:
+                status_icon = "🟡"
+                status_text = "MODERATE (เริ่มลดความปลอดภัย)"
+
+            # 📏 หาเหรียญที่เสี่ยงที่สุด
+            pos_btc = next((p for p in acc['positions'] if p['symbol'] == self.symbol), None)
+            liq_p = safe_float(pos_btc.get('liquidationPrice', 0)) if pos_btc else 0.0
+            cur_p = self.current_price
+            liq_dist = ((cur_p - liq_p) / cur_p * 100) if cur_p > 0 and liq_p > 0 else 100.0
+
+            msg = f"{status_icon} *PORTFOLIO RISK SCAN*\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"📊 *Margin Ratio:* `{m_ratio:.2f}%`\n"
+            msg += f"🛡️ *Health Status:* `{status_text}`\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"💰 *Account Equity:* `${m_bal:,.2f}`\n"
+            msg += f"💵 *Avaliable Buffer:* `${a_bal:,.2f}`\n"
+            msg += f"📈 *Current UNPNL:* `${unpnl:+.2f} USDT`\n"
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            
+            if liq_p > 0:
+                msg += f"🎯 *Liquidation Insight ({self.symbol}):*\n"
+                msg += f"└ Liq. Price: `${liq_p:,.2f}`\n"
+                msg += f"└ ห่างจากราคาจริง: `{liq_dist:.2f}%`\n"
+                
+                # ⚖️ คำนวณ Margin Equilibrium: ทนกราฟวิ่งผิดทางได้อีกกี่เหรียญ?
+                p_amt = abs(safe_float(pos_btc.get('positionAmt', 0)))
+                if p_amt > 0:
+                    buffer_usd = a_bal / p_amt
+                    msg += f"└ *Equilibrium:* ทนได้อีก `${buffer_usd:,.2f}` (ราคาเหรียญ)\n"
+
+            msg += "━━━━━━━━━━━━━━━━━━\n"
+            msg += f"🕒 _Updated: {datetime.now().strftime('%H:%M:%S')}_"
+
+            await self.tg.send_message(msg)
+        except Exception as e:
+            logger.error(f"Risk Scan Error: {e}")
+            await self.tg.send_message("❌ ไม่สามารถประมวลผลการสแกนความเสี่ยงได้ในขณะนี้")
+
+    async def hourly_alert_task(self):
+        """ส่งรายงานวิเคราะห์ทางออกอัตโนมัติทุก 1 ชั่วโมง ถ้ามี Position ค้างอยู่"""
+        while True:
+            try:
+                # รอ 1 ชั่วโมง (3600 วินาที)
+                await asyncio.sleep(3600)
+                
+                # เช็คว่ามี Position ไหม
+                acc = await self._get_cached_account()
+                if acc:
+                    pos = next((p for p in acc.get('positions', []) if p['symbol'] == self.symbol), None)
+                    p_amt = abs(safe_float(pos['positionAmt'])) if pos else 0.0
+                    if p_amt > 0:
+                        await self.send_exit_analysis(is_auto=True)
+            except Exception as e:
+                logger.error(f"Hourly Alert Task Error: {e}")
+                await asyncio.sleep(60)
 
     async def set_pause(self, s):
         self.gl_paused = s
@@ -1563,7 +2022,7 @@ class MainCommandCenter:
     def _get_dynamic_cooldown(self) -> int:
         """🧭 Dynamic Cooldown ตาม Regime (Priority 2 Active)
         CHOPPY   → 60s  (Liquidity กลับเร็ว, ไม่เสียโอกาส)
-        TRENDING → 120s (รอ Momentum หมดแรงก่อน DCA)
+        TRENDING → 300s (Data n=27: DUMP 37% / FLAT 52% / BOUNCE 11% → รอ Momentum หมดแรง)
         VOLATILE → 240s (Capital Preservation สูงสุด)
         WARMING  → 60s  (buffer ยังน้อย ใช้ค่าปลอดภัย)
         """
@@ -1615,6 +2074,21 @@ class MainCommandCenter:
                     self._kill_reason = ""
                     self._vol_spike_count = 0
                     self._safe_bar_count = 0
+                    # 🛡️ Restore last_buy_price จาก entry_p เสมอ (ไม่ว่าจะ 0 หรือไม่)
+                    # entry_p คือราคาเฉลี่ยจริง → next_buy_price ถอยห่างตาม grid_step
+                    # ถ้าปล่อยเป็น cur_p → next_buy_price ≈ cur_p → DCA trigger ทันที (bug)
+                    try:
+                        acc_ks = await self._get_cached_account()
+                        pos_ks = next((p for p in acc_ks.get('positions', []) if p['symbol'] == self.symbol), None) if acc_ks else None
+                        entry_ks = safe_float(pos_ks['entryPrice']) if pos_ks else 0.0
+                        if entry_ks > 0:
+                            self.last_buy_price = entry_ks
+                            logger.info(f"🛡️ KS Release: last_buy_price = ${entry_ks:,.2f} (entry_p)")
+                    except Exception:
+                        pass
+                    # 🛡️ Cooldown 30s หลัง KS release ป้องกัน DCA ทันที
+                    # ตั้ง last_close_time ให้เหมือนเพิ่งปิดไป 30 วินาที → รอ cooldown อีก 30s
+                    self.last_close_time = now - 30.0
                     logger.info(f"✅ Full Cooldown Recovery released. Regime={regime}")
                     await self.tg.send_message(f"✅ *Kill Switch Released:* หมดเวลายับยั้งและตลาดฟื้นตัวอยู่ในเกณฑ์ที่ตั้งไว้ครับ\n🧭 Regime: `{regime}`")
             else:
@@ -1732,6 +2206,31 @@ class MainCommandCenter:
         except Exception as e:
             logger.warning(f"📓 Flip log load error: {e}")
 
+    def _trailing_state_save(self):
+        """บันทึก trailing state ลงไฟล์ — ป้องกัน peak_price หาย เมื่อ restart"""
+        try:
+            import json
+            state = {"trailing_active": self.trailing_active, "peak_price": self.peak_price}
+            with open(self._trailing_state_path, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            logger.warning(f"📌 Trailing state save error: {e}")
+
+    def _trailing_state_load(self):
+        """โหลด trailing state เมื่อ restart — ถ้าเคย activate ก่อน restart จะทำงานต่อได้"""
+        try:
+            import json
+            if not os.path.exists(self._trailing_state_path):
+                return
+            with open(self._trailing_state_path, "r") as f:
+                state = json.load(f)
+            if state.get("trailing_active") and state.get("peak_price", 0) > 0:
+                self.trailing_active = True
+                self.peak_price = state["peak_price"]
+                logger.info(f"📌 Trailing state loaded: active=True, peak=${self.peak_price:,.0f}")
+        except Exception as e:
+            logger.warning(f"📌 Trailing state load error: {e}")
+
     def _get_flip_stats(self) -> str:
         """สรุปสถิติ Flip Log — Win Rate แยกตาม Regime
         คืน string สำหรับแสดงใน Dashboard หรือ Telegram
@@ -1748,7 +2247,11 @@ class MainCommandCenter:
             stats[r][e["outcome_label"]] += 1
             stats[r]["total"] += 1
 
-        lines = [f"📓 *Flip Log Stats* ({len(completed)} events)"]
+        # นับ KS triggered vs bypassed
+        ks_fired = sum(1 for e in completed if e.get("ks_triggered", True))
+        ks_bypass = len(completed) - ks_fired
+
+        lines = [f"📓 *Flip Log Stats* ({len(completed)} events | KS fired={ks_fired} bypass={ks_bypass})"]
         for regime, s in sorted(stats.items()):
             total = s["total"]
             bounce_rate = s["BOUNCE"] / total * 100
@@ -1923,15 +2426,40 @@ class MainCommandCenter:
             self._monitor_interval = 900  # เช็คทุก 15 นาที
 
         # ---- Rule 1: กำไรถึงเป้า → ปิดทันที ----
-        if pnl >= self.MONITOR_PROFIT_TARGET and abs(p_amt) > 0:
+        # 🧠 Dynamic Profit Target: Layer สูง = รอ profit มากขึ้น (คุ้มค่ากับความเสี่ยงที่แบกมา)
+        # Layer 1-5: $5 | Layer 6-7: $8 | Layer 8-9: $12 | Layer 10+: $18
+        if self.active_layers >= 10:
+            dynamic_profit_target = 18.0
+        elif self.active_layers >= 8:
+            dynamic_profit_target = 12.0
+        elif self.active_layers >= 6:
+            dynamic_profit_target = 8.0
+        else:
+            dynamic_profit_target = self.MONITOR_PROFIT_TARGET
+
+        if pnl >= dynamic_profit_target and abs(p_amt) > 0:
             if alert["type"] != "close" or abs(pnl - alert["pnl"]) > 1.0:
-                logger.info(f"🤖 Monitor: กำไร ${pnl:.2f} ถึงเป้า → ปิด Position")
-                await self.tg.send_message(f"🤖 *AUTO-MONITOR*: กำไร `${pnl:.2f}` ถึงเป้า `${self.MONITOR_PROFIT_TARGET}` → ปิด Position อัตโนมัติ!")
+                closed_from_layer = self.active_layers
+                logger.info(f"🤖 Monitor: กำไร ${pnl:.2f} ถึงเป้า (Layer {closed_from_layer}) → ปิด Position")
+                await self.tg.send_message(f"🤖 *AUTO-MONITOR*: กำไร `${pnl:.2f}` ถึงเป้า `${dynamic_profit_target}` (Layer `{closed_from_layer}`) → ปิด Position อัตโนมัติ!")
                 side = "SELL" if p_amt > 0 else "BUY"
                 await self._execute_trade(client, side, abs(p_amt), True)
                 self.last_close_time = time.time()
                 self.active_layers, self.trailing_active = 0, False
-                self._monitor_last_alert = {"type": None, "pnl": 0.0, "layers": 0}  # 🔄 Reset เพื่อรอบใหม่
+                self._monitor_last_alert = {"type": None, "pnl": 0.0, "layers": 0}
+
+                # 🔄 Post-TP Auto-Reset: ถ้าปิดจาก Layer สูง (≥6) → reset กลับ NORMAL อัตโนมัติ
+                # เพื่อให้รอบใหม่ใช้ Grid Step ปกติ ไม่ใช่ SAFE 3x
+                if closed_from_layer >= 6 and self.strategy_mode in ("SAFE", "PROFIT"):
+                    self.strategy_mode = "NORMAL"
+                    self._equity_kill_active = False
+                    self._last_closed_from_high_layer = True  # flag: รอบใหม่ต้องระวังมากขึ้น
+                    await self.update_strategy_parameters()
+                    await self.tg.send_message(
+                        f"✅ *POST-TP AUTO-RESET*: ปิดสำเร็จจาก Layer `{closed_from_layer}` → Reset โหมดกลับ `NORMAL` แล้วครับ\n"
+                        f"🆕 รอบใหม่จะเริ่มที่ Layer 1 ด้วย Grid Step ปกติ\n"
+                        f"⏳ รอ 5 นาทีและ OBI ยืนยันก่อนเปิดไม้แรก"
+                    )
             return
 
         # ---- Rule 2: ใกล้กำไร → เปลี่ยน PROFIT mode (เฉพาะเมื่อไม้ยังปลอดภัย < 8) ----

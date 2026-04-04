@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 from loguru import logger # pyre-ignore
 
 class BinanceAsyncClient:
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://fapi1.binance.com", proxy: Optional[str] = None,
+    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://fapi.binance.com", proxy: Optional[str] = None,
                  cf_worker_url: Optional[str] = None, cf_proxy_secret: Optional[str] = None):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -120,7 +120,7 @@ class BinanceAsyncClient:
                     if response.status == 200:
                         return data
                     else:
-                        logger.error(f"Binance API Error: {response.status} - {data} | Path: {path}")
+                        logger.error(f"Binance API Error: {response.status} - {data} | URL: {url}")
                         if response.status in [429, 418]: 
                             retry_after = int(response.headers.get("Retry-After", 60))
                             if response.status == 418 and isinstance(data, dict) and 'msg' in data:
@@ -184,6 +184,18 @@ class BinanceAsyncClient:
 
     async def change_leverage(self, symbol: str, leverage: int):
         return await self._request("POST", "/fapi/v1/leverage", signed=True, params={"symbol": symbol, "leverage": leverage}, priority=0)
+
+    async def get_bnb_burn_status(self):
+        """ตรวจสอบว่าเปิด BNB fee burn อยู่ไหม"""
+        return await self._request("GET", "/sapi/v1/bnbBurn", signed=True, priority=1)
+
+    async def set_bnb_burn(self, spot_bnb_burn: bool = True, interest_bnb_burn: bool = True):
+        """เปิด BNB fee burn — spotBNBBurn=true ใช้ BNB จ่าย fee Spot/Futures"""
+        params = {
+            "spotBNBBurn": "true" if spot_bnb_burn else "false",
+            "interestBNBBurn": "true" if interest_bnb_burn else "false",
+        }
+        return await self._request("POST", "/sapi/v1/bnbBurn", signed=True, params=params, priority=0)
 
     async def create_order(self, symbol: str, side: str, order_type: str, quantity: str, price: Optional[str] = None, **kwargs):
         params = {"symbol": symbol, "side": side.upper(), "type": order_type.upper(), "quantity": quantity}
