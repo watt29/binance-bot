@@ -1,5 +1,16 @@
 # 🏰 COMMANDER v2.4: INSTITUTIONAL-GRADE MICROSTRUCTURE BOT
 
+> ## ⚠️ สถานะปัจจุบัน (2026-04-04)
+> **รันบอทบนเครื่อง Windows ตัวเองแทน VPS**
+> แผนถัดไป: ย้ายไป Vultr Tokyo ($6/เดือน จ่ายด้วย PayPal) เมื่อพร้อม
+>
+> **วิธีรันบน Windows:**
+> ```
+> cd C:\Users\Asus\Desktop\binance-sever-render
+> pm2 start extra\pm2.config.js
+> pm2 logs commander
+> ```
+
 ระบบบอทเทรด Binance Futures ที่ออกแบบตามหลัก **Market Microstructure** ระดับสถาบัน ผสาน Order Book Analysis, Whale Signal, Spoof Detection, Trade-based OBI, Regime Detection, Dynamic Kill Switch, VolatilityGate, Dynamic Lot Sizing, Equity Kill Switch, Variance Age Exit, Flip Logger, Auto-Monitor, Cloudflare Worker IP Bypass, BNB Fee Burn, Maker Rebate Tracking, OBI Quote Cancellation, Inventory TP Scaling และ **WATCHDOG v1.2** ไว้ในระบบเดียว
 
 **Philosophy: "รอดให้ได้ก่อน แล้วค่อยทำกำไร"**

@@ -1,5 +1,17 @@
 # Migration Checklist — Google Cloud → Oracle Cloud Tokyo
 
+> ## ⚠️ สถานะปัจจุบัน (2026-04-04)
+> **หยุดพักแผน Migration ชั่วคราว — รันบอทบนเครื่อง Windows ตัวเองแทน**
+> เหตุผล: ยังไม่มีบัตรเครดิต/วิธีชำระเงินที่พร้อม
+> กลับมาทำต่อเมื่อพร้อม — ใช้ Vultr + PayPal
+>
+> **วิธีรันบนเครื่อง Windows ตอนนี้:**
+> ```
+> cd C:\Users\Asus\Desktop\binance-sever-render
+> pm2 start extra\pm2.config.js
+> pm2 save
+> ```
+
 ## PHASE 1: สมัคร Oracle Cloud (PAYG — แนะนำอย่างยิ่ง)
 - [ ] ไปที่ cloud.oracle.com → สมัครบัญชีใหม่
 - [ ] เลือกบัญชีแบบ **Pay As You Go (PAYG)**
