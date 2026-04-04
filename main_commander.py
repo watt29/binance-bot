@@ -1411,8 +1411,13 @@ class MainCommandCenter:
             # 🖼️ PREMIUM DASHBOARD CONSTRUCTION
             msg =  f"🏰 *COMMANDER DASHBOARD v2.0*\n"
             msg += f"━━━━━━━━━━━━━━━━━━\n"
+            unpnl_now  = safe_float(pos['unrealizedProfit']) if pos else 0.0
+            margin_bal = w_bal + unpnl_now
             msg += f"📡 Status: `{status_text}` | Mode: `{m_icon}`\n"
-            msg += f"💰 Balance: `${w_bal:,.2f}` (`${a_bal:,.2f}` avail)\n"
+            msg += f"💰 Wallet Balance:  `${w_bal:,.2f}` USDT\n"
+            msg += f"📊 Margin Balance:  `${margin_bal:,.2f}` USDT\n"
+            msg += f"💵 Available:       `${a_bal:,.2f}` USDT\n"
+            msg += f"📉 Unrealized PNL:  `${unpnl_now:,.2f}` USDT\n"
             msg += f"⚙️ Grid Step: `{self.grid_step_pct:.3f}%` | TP: `+{self.target_net_profit_pct:.2f}%` (Net)\n"
             msg += f"━━━━━━━━━━━━━━━━━━\n"
             
@@ -1431,11 +1436,23 @@ class MainCommandCenter:
                 side_icon = "📈 LONG" if p_amt > 0 else "📉 SHORT"
                 pnl_icon = "🔥" if pnl >= 0 else "❄️"
                 
+                liq_p      = safe_float(pos.get('liquidationPrice', 0))
+                iso_margin = safe_float(pos.get('isolatedWallet', 0))
+                maint_m    = safe_float(pos.get('maintMargin', 0))
+                margin_ratio = (maint_m / iso_margin * 100) if iso_margin > 0 else 0.0
+                liq_dist   = (mark_p - liq_p) / mark_p * 100 if liq_p > 0 and mark_p > 0 else 0.0
+                notional   = abs(p_amt) * mark_p
+                margin_ratio_icon = "🔴" if margin_ratio >= 80 else ("🟡" if margin_ratio >= 50 else "🟢")
+
                 msg += f"🚀 *POSITION: {side_icon} | {abs(p_amt):.3f} BTC*\n"
                 msg += f"├ {pnl_icon} PNL: *${pnl:,.2f}* (`{pnl_p:+.2f}%`)\n"
-                msg += f"├ Entry: `${entry_p:,.2f}`\n"
-                msg += f"├ Mark:  `${mark_p:,.2f}`\n"
-                msg += f"└ *Net BE:* `${be_p:,.2f}`\n"
+                msg += f"├ Entry:    `${entry_p:,.2f}`\n"
+                msg += f"├ Mark:     `${mark_p:,.2f}`\n"
+                msg += f"├ Net BE:   `${be_p:,.2f}`\n"
+                msg += f"├ Liq.:     `${liq_p:,.2f}` (ห่าง `{liq_dist:.2f}%`)\n"
+                msg += f"├ Notional: `${notional:,.2f}` ({self.leverage}x)\n"
+                msg += f"├ Margin:   `${iso_margin:,.2f}` USDT (Isolated)\n"
+                msg += f"└ {margin_ratio_icon} Margin Ratio: `{margin_ratio:.2f}%`\n"
                 
                 if self.next_buy_price > 0:
                     msg += f"━━━━━━━━━━━━━━━━━━\n"
