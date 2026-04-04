@@ -1445,11 +1445,13 @@ class MainCommandCenter:
                 
                 # ดึงจาก positionRisk (แม่นยำกว่า cached account)
                 liq_p        = safe_float(_pos_risk.get('liquidationPrice', 0)) if _pos_risk else 0.0
-                iso_margin   = safe_float(_pos_risk.get('isolatedWallet', 0)) if _pos_risk else safe_float(pos.get('isolatedWallet', 0))
-                maint_m      = safe_float(_pos_risk.get('maintMargin', 0)) if _pos_risk else safe_float(pos.get('maintMargin', 0))
+                iso_wallet   = safe_float(_pos_risk.get('isolatedWallet', 0)) if _pos_risk else 0.0
+                iso_margin   = safe_float(_pos_risk.get('isolatedMargin', 0)) if _pos_risk else 0.0
+                notional     = safe_float(_pos_risk.get('notional', 0)) if _pos_risk else abs(p_amt) * mark_p
+                # คำนวณ Margin Ratio = maintMargin / isolatedMargin (0.4% notional สำหรับ BTC tier1)
+                maint_m      = abs(notional) * 0.004
                 margin_ratio = (maint_m / iso_margin * 100) if iso_margin > 0 else 0.0
                 liq_dist     = (mark_p - liq_p) / mark_p * 100 if liq_p > 0 and mark_p > 0 else 0.0
-                notional     = abs(p_amt) * mark_p
                 margin_ratio_icon = "🔴" if margin_ratio >= 80 else ("🟡" if margin_ratio >= 50 else "🟢")
 
                 msg += f"🚀 *POSITION: {side_icon} | {abs(p_amt):.3f} BTC*\n"
@@ -1459,7 +1461,7 @@ class MainCommandCenter:
                 msg += f"├ Net BE:   `${be_p:,.2f}`\n"
                 msg += f"├ Liq.:     `${liq_p:,.2f}` (ห่าง `{liq_dist:.2f}%`)\n"
                 msg += f"├ Notional: `${notional:,.2f}` ({self.leverage}x)\n"
-                msg += f"├ Margin:   `${iso_margin:,.2f}` USDT (Isolated)\n"
+                msg += f"├ Margin:   `${iso_wallet:,.2f}` USDT (Isolated)\n"
                 msg += f"└ {margin_ratio_icon} Margin Ratio: `{margin_ratio:.2f}%`\n"
                 
                 if self.next_buy_price > 0:
